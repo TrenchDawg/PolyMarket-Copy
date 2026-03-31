@@ -108,21 +108,30 @@ class PolymarketClient:
             }
         )
         return data if isinstance(data, list) else []
-
-    def get_closed_positions(self, wallet: str) -> list:
-        """Get resolved/closed positions for a wallet."""
-        data = self._get(
-            f"{POLYMARKET_DATA_API}/positions",
-            params={
-                "user": wallet,
-                "sizeThreshold": 0,
-                "sortBy": "CASHPNL",
-                "sortDirection": "DESC",
-                "status": "closed",
-            }
-        )
-        return data if isinstance(data, list) else []
-
+    
+    def get_closed_positions(self, wallet: str, max_pages: int = 10) -> list:
+        """Get resolved/closed positions for a wallet. Paginates up to max_pages * 50."""
+        all_positions = []
+        for page in range(max_pages):
+            offset = page * 50
+            data = self._get(
+                f"{POLYMARKET_DATA_API}/closed-positions",
+                params={
+                    "user": wallet,
+                    "limit": 50,
+                    "offset": offset,
+                    "sortBy": "REALIZEDPNL",
+                    "sortDirection": "DESC",
+                }
+            )
+            if not data or not isinstance(data, list):
+                break
+            all_positions.extend(data)
+            if len(data) < 50:
+                break
+            time.sleep(0.3)
+        return all_positions
+    
     def get_trades(self, wallet: str, limit: int = 100) -> list:
         """Get trade history for a wallet."""
         data = self._get(
