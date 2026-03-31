@@ -89,7 +89,7 @@ class PolymarketClient:
             all_traders.extend(batch)
             if len(batch) < LEADERBOARD_LIMIT:
                 break
-            time.sleep(0.5)  # be polite to rate limits
+            time.sleep(0.5)
         return all_traders
 
     # ============================================================
@@ -108,7 +108,7 @@ class PolymarketClient:
             }
         )
         return data if isinstance(data, list) else []
-    
+
     def get_closed_positions(self, wallet: str, max_pages: int = 10) -> list:
         """Get resolved/closed positions for a wallet. Paginates up to max_pages * 50."""
         all_positions = []
@@ -131,7 +131,7 @@ class PolymarketClient:
                 break
             time.sleep(0.3)
         return all_positions
-    
+
     def get_trades(self, wallet: str, limit: int = 100) -> list:
         """Get trade history for a wallet."""
         data = self._get(
@@ -204,7 +204,7 @@ class PolymarketClient:
         )
 
     # ============================================================
-    # Market holders (useful for whale tracking)
+    # Market holders
     # ============================================================
 
     def get_top_holders(self, condition_id: str) -> list:
