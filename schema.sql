@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS trader_positions (
     condition_id    VARCHAR(66) NOT NULL,     -- market condition ID
     asset_id        TEXT NOT NULL,            -- outcome token asset ID
     title           TEXT,                     -- market title
-    outcome         VARCHAR(10),             -- "Yes" or "No"
+    outcome         VARCHAR(100),             -- "Yes" or "No"
     size            NUMERIC(18,6),           -- number of shares
     avg_price       NUMERIC(10,6),           -- average entry price
     current_price   NUMERIC(10,6),
