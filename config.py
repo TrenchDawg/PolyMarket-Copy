@@ -14,12 +14,10 @@ POLYMARKET_GAMMA_API = "https://gamma-api.polymarket.com"
 # Scoring weights (must sum to 1.0)
 # ============================================================
 SCORING_WEIGHTS = {
-    "roi":             0.30,
-    "consistency":     0.30,
-    "win_rate":        0.20,
-    "volume":          0.05,
-    "recency":         0.08,
-    "diversification": 0.07,
+    "consistency": 0.35,   # Sharpe ratio — steady returns, low variance
+    "win_rate":    0.30,   # High hit rate means fewer drawdowns
+    "roi":         0.20,   # Positive returns, but size doesn't matter
+    "recency":     0.15,   # Must be active and winning NOW
 }
 assert abs(sum(SCORING_WEIGHTS.values()) - 1.0) < 0.001, "Weights must sum to 1.0"
 
@@ -27,25 +25,27 @@ assert abs(sum(SCORING_WEIGHTS.values()) - 1.0) < 0.001, "Weights must sum to 1.
 # Trader filters (hard cutoffs before scoring)
 # ============================================================
 MIN_RESOLVED_POSITIONS = 20      # minimum closed trades to be scored
-MIN_VOLUME_USD = 1000            # minimum total volume
-MAX_DAYS_SINCE_LAST_TRADE = 14   # must have traded recently
+MIN_VOLUME_USD = 500            # minimum total volume (basic dust filter)
+MAX_DAYS_SINCE_LAST_TRADE = 7    # must have traded recently
 REQUIRE_POSITIVE_PNL = True      # only score profitable traders
+MIN_RECENT_WIN_RATE = 0.90       # 90% win rate in last 30 days
+MIN_POSITIONS_VALUE = 0.01       # must have live positions worth >$0
+MIN_ROI = 0.01                   # 1% minimum blended ROI
+MIN_RECENT_TRADES_PER_DAY = 0.5  # minimum average trades per day in last 30 days
+MIN_RECENT_POSITIONS = 5         # must have at least 5 closed positions in last 30 days
 
 # ============================================================
 # Leaderboard scraping parameters
 # ============================================================
-LEADERBOARD_CATEGORIES = [
-    "OVERALL", "POLITICS", "SPORTS", "CRYPTO",
-    "CULTURE", "ECONOMICS", "TECH", "FINANCE"
-]
-LEADERBOARD_TIME_PERIODS = ["WEEK", "MONTH", "ALL"]
+LEADERBOARD_CATEGORIES = ["OVERALL"]
+LEADERBOARD_TIME_PERIODS = ["MONTH", "ALL"]
 LEADERBOARD_LIMIT = 50           # max per API call
-LEADERBOARD_MAX_PAGES = 4        # 50 * 4 = 200 traders per category/period
+LEADERBOARD_MAX_PAGES = 6        # 50 * 6 = 300 traders per period
 
 # ============================================================
 # Scheduling intervals
 # ============================================================
-RANKING_INTERVAL_HOURS = 6       # re-score traders every 6 hours
+RANKING_INTERVAL_HOURS = 24      # re-score traders every 24 hours
 POSITION_POLL_MINUTES = 3        # check followed traders every 3 minutes
 ALERT_SUMMARY_HOUR = 20          # daily summary at 8pm
 
@@ -57,6 +57,25 @@ MAX_POSITION_USD = 50.0             # hard cap per trade
 MAX_DAILY_TRADES = 10               # circuit breaker
 MIN_LIQUIDITY_USD = 5000            # skip illiquid markets
 MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
+
+# ============================================================
+# Open position health check
+# ============================================================
+HEALTH_HARD_FILTER = -0.50      # exclude traders losing >50% of portfolio on open positions
+HEALTH_PENALTY_FACTOR = 0.5     # how aggressively to penalize (0.5 = moderate)
+
+# ============================================================
+# Efficiency bonus (rewards traders strong on BOTH WR and ROI)
+# ============================================================
+EFFICIENCY_BONUS_MAX = 0.15     # max composite score boost (15%)
+EFFICIENCY_WR_BASELINE = 0.89   # WR baseline for efficiency calc (90% WR → small positive)
+
+# ============================================================
+# Recent performance weighting
+# ============================================================
+RECENT_WINDOW_DAYS = 30         # positions closed in last 30 days = "recent"
+RECENT_WEIGHT = 0.70            # weight for recent metrics
+OLDER_WEIGHT = 0.30             # weight for older metrics (must sum to 1.0 with RECENT_WEIGHT)
 
 # ============================================================
 # Database

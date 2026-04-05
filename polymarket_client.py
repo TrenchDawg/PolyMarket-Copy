@@ -109,7 +109,7 @@ class PolymarketClient:
         )
         return data if isinstance(data, list) else []
 
-    def get_closed_positions(self, wallet: str, max_pages: int = 10) -> list:
+    def get_closed_positions(self, wallet: str, max_pages: int = 40) -> list:
         """Get resolved/closed positions for a wallet. Paginates up to max_pages * 50."""
         all_positions = []
         for page in range(max_pages):
@@ -120,7 +120,7 @@ class PolymarketClient:
                     "user": wallet,
                     "limit": 50,
                     "offset": offset,
-                    "sortBy": "REALIZEDPNL",
+                    "sortBy": "TIMESTAMP",
                     "sortDirection": "DESC",
                 }
             )
@@ -157,12 +157,32 @@ class PolymarketClient:
         )
         return data if isinstance(data, list) else []
 
-    def get_portfolio_value(self, wallet: str) -> Optional[dict]:
-        """Get total portfolio value for a wallet."""
-        return self._get(
+    def get_portfolio_value_usd(self, wallet: str) -> float:
+        """Get current market value of all positions. Returns 0.0 if unavailable."""
+        data = self._get(
             f"{POLYMARKET_DATA_API}/value",
             params={"user": wallet}
         )
+        if not data:
+            return 0.0
+        if isinstance(data, list) and len(data) > 0:
+            return float(data[0].get("value", 0))
+        if isinstance(data, dict):
+            return float(data.get("value", 0))
+        return 0.0
+
+    def get_leaderboard_for_user(self, wallet: str, time_period: str = "ALL") -> Optional[dict]:
+        """Get leaderboard stats for a single user."""
+        data = self._get(
+            f"{POLYMARKET_DATA_API}/v1/leaderboard",
+            params={
+                "user": wallet,
+                "timePeriod": time_period,
+            }
+        )
+        if isinstance(data, list) and len(data) > 0:
+            return data[0]
+        return None
 
     def get_total_markets_traded(self, wallet: str) -> Optional[int]:
         """Get count of markets a user has traded."""
@@ -171,7 +191,7 @@ class PolymarketClient:
             params={"user": wallet}
         )
         if isinstance(data, dict):
-            return data.get("totalMarkets", 0)
+            return data.get("traded", 0)
         return 0
 
     # ============================================================
