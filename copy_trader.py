@@ -16,9 +16,7 @@ from config import (
     MAX_DAILY_TRADES,
     MIN_LIQUIDITY_USD,
     MAX_SPREAD_PCT,
-    ALERT_EMAIL_TO,
-    GMAIL_SENDER,
-    GMAIL_APP_PASSWORD,
+    ALERT_WEBHOOK_URL,
 )
 from db import (
     get_followed_traders,
@@ -42,6 +40,7 @@ def detect_new_positions(wallet: str) -> list:
     """
     Compare current positions with last snapshot.
     Returns list of NEW positions (not seen in previous snapshot).
+    On first ever poll for a trader, saves baseline and returns empty list.
     """
     # Get current positions from API
     current = client.get_positions(wallet, size_threshold=10)
@@ -50,6 +49,13 @@ def detect_new_positions(wallet: str) -> list:
 
     # Get last snapshot from DB
     previous = get_latest_positions(wallet)
+
+    # First snapshot ever for this trader — save baseline, don't alert
+    if not previous:
+        save_position_snapshot(wallet, current)
+        print(f"[POLL] {wallet[:10]}: First snapshot saved ({len(current)} positions), no alerts")
+        return []
+
     prev_assets = {p["asset_id"] for p in previous}
 
     # Find new positions
@@ -126,43 +132,26 @@ def calculate_position_size(portfolio_value: float) -> float:
 
 
 # ============================================================
-# Alerting (Gmail)
+# Alerting (n8n webhook)
 # ============================================================
 
-def _send_email(subject: str, body: str):
-    """Send an email via Gmail SMTP."""
-    import smtplib
-    from email.mime.text import MIMEText
-    from email.mime.multipart import MIMEMultipart
-
-    if not all([GMAIL_SENDER, GMAIL_APP_PASSWORD, ALERT_EMAIL_TO]):
-        print(f"[ALERT] Gmail not configured, printing instead:\n  Subject: {subject}\n  {body}")
-        return
-
-    msg = MIMEMultipart()
-    msg["From"] = GMAIL_SENDER
-    msg["To"] = ALERT_EMAIL_TO
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        print(f"[ALERT] Email sent: {subject}")
-    except Exception as e:
-        print(f"[ALERT] Email send failed: {e}")
-
-
 def send_alert(alert_type: str, payload: dict):
-    """Send alert via Gmail and log it."""
+    """Send alert via n8n webhook and log it."""
     log_alert(alert_type, payload)
 
+    if not ALERT_WEBHOOK_URL:
+        print(f"[ALERT] No webhook configured: {alert_type}")
+        return
+
+    webhook_data = {
+        "alert_type": alert_type,
+        "payload": payload,
+    }
+
     if alert_type == "NEW_TRADE":
-        subject = f"Polymarket Copy Trade: {payload.get('market_title', 'unknown')}"
-        body = (
+        webhook_data["subject"] = f"Copy Trade: {payload.get('market_title', 'unknown')}"
+        webhook_data["body"] = (
             f"Copy Trade Executed\n"
-            f"{'='*40}\n"
             f"Trader: {payload.get('source_username', 'unknown')}\n"
             f"Market: {payload.get('market_title', 'unknown')}\n"
             f"Side: {payload.get('outcome', '?')} @ {payload.get('entry_price', '?')}\n"
@@ -171,38 +160,43 @@ def send_alert(alert_type: str, payload: dict):
             f"Dry Run: {payload.get('dry_run', False)}"
         )
     elif alert_type == "NEW_POSITION_DETECTED":
-        subject = f"Polymarket Alert: {payload.get('source_username', 'unknown')} new position"
-        body = (
-            f"New Position Detected (no auto-trade)\n"
-            f"{'='*40}\n"
+        webhook_data["subject"] = f"New Position: {payload.get('source_username', 'unknown')}"
+        webhook_data["body"] = (
+            f"New Position Detected (alert only)\n"
             f"Trader: {payload.get('source_username', 'unknown')}\n"
             f"Market: {payload.get('title', 'unknown')}\n"
-            f"Outcome: {payload.get('outcome', '?')} — {payload.get('size', 0):.1f} shares @ {payload.get('avg_price', 0):.4f}\n"
-            f"Kill switch is OFF — alert only"
+            f"Outcome: {payload.get('outcome', '?')}\n"
+            f"Shares: {payload.get('size', 0):.1f} @ {payload.get('avg_price', 0):.4f}\n"
+            f"Kill switch is OFF"
         )
     elif alert_type == "DAILY_SUMMARY":
-        subject = "Polymarket Copy Trader — Daily Summary"
-        body = (
-            f"Daily Copy Trading Summary\n"
-            f"{'='*40}\n"
+        webhook_data["subject"] = "Polymarket Copy Trader - Daily Summary"
+        webhook_data["body"] = (
+            f"Daily Summary\n"
             f"Trades today: {payload.get('trades_today', 0)}\n"
             f"Open positions: {payload.get('open_positions', 0)}\n"
             f"Daily PnL: ${payload.get('daily_pnl', 0):.2f}\n"
             f"Followed traders: {payload.get('followed_count', 0)}"
         )
     elif alert_type == "CIRCUIT_BREAKER":
-        subject = "Polymarket ALERT: Circuit Breaker Triggered"
-        body = (
-            f"Circuit Breaker Triggered\n"
-            f"{'='*40}\n"
-            f"Reason: {payload.get('reason', 'unknown')}\n"
-            f"Auto-trading paused for the day"
-        )
+        webhook_data["subject"] = "ALERT: Circuit Breaker Triggered"
+        webhook_data["body"] = f"Reason: {payload.get('reason', 'unknown')}"
     else:
-        subject = f"Polymarket Alert: {alert_type}"
-        body = json.dumps(payload, indent=2)
+        webhook_data["subject"] = f"Polymarket Alert: {alert_type}"
+        webhook_data["body"] = str(payload)
 
-    _send_email(subject, body)
+    try:
+        resp = requests.post(
+            ALERT_WEBHOOK_URL,
+            json=webhook_data,
+            timeout=10,
+        )
+        if resp.status_code < 300:
+            print(f"[ALERT] Webhook sent: {webhook_data['subject']}")
+        else:
+            print(f"[ALERT] Webhook failed ({resp.status_code}): {webhook_data['subject']}")
+    except Exception as e:
+        print(f"[ALERT] Webhook error: {e}")
 
 
 # ============================================================

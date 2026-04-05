@@ -86,11 +86,9 @@ DATABASE_URL = os.getenv(
 )
 
 # ============================================================
-# Alerts (Gmail)
+# Alerts (n8n webhook)
 # ============================================================
-ALERT_EMAIL_TO = os.getenv("ALERT_EMAIL_TO", "")       # your email address
-GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")           # sending Gmail address
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "") # Gmail app password
+ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
 
 # ============================================================
 # Polymarket authentication (for order placement)
