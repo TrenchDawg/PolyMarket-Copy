@@ -34,8 +34,8 @@ CREATE TABLE IF NOT EXISTS traders (
     updated_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_traders_composite ON traders(composite_score DESC);
-CREATE INDEX idx_traders_followed ON traders(is_followed) WHERE is_followed = TRUE;
+CREATE INDEX IF NOT EXISTS idx_traders_composite ON traders(composite_score DESC);
+CREATE INDEX IF NOT EXISTS idx_traders_followed ON traders(is_followed) WHERE is_followed = TRUE;
 
 -- ============================================================
 -- TRADER_POSITIONS: Snapshot of each followed trader's positions
@@ -58,7 +58,7 @@ CREATE TABLE IF NOT EXISTS trader_positions (
     UNIQUE(proxy_wallet, asset_id, snapshot_at)
 );
 
-CREATE INDEX idx_positions_wallet ON trader_positions(proxy_wallet, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_positions_wallet ON trader_positions(proxy_wallet, snapshot_at DESC);
 
 -- ============================================================
 -- COPY_TRADES: Our mirror trades — what we actually executed
@@ -91,8 +91,8 @@ CREATE TABLE IF NOT EXISTS copy_trades (
     created_at          TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_copy_trades_status ON copy_trades(status);
-CREATE INDEX idx_copy_trades_source ON copy_trades(source_wallet);
+CREATE INDEX IF NOT EXISTS idx_copy_trades_status ON copy_trades(status);
+CREATE INDEX IF NOT EXISTS idx_copy_trades_source ON copy_trades(source_wallet);
 
 -- ============================================================
 -- SCORING_HISTORY: Track how trader scores change over time
@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS scoring_history (
     scored_at       TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE INDEX idx_scoring_history_wallet ON scoring_history(proxy_wallet, scored_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scoring_history_wallet ON scoring_history(proxy_wallet, scored_at DESC);
 
 -- ============================================================
 -- SYSTEM_CONFIG: Runtime configuration (kill switch, etc.)
