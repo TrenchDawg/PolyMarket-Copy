@@ -252,6 +252,94 @@ def is_kill_switch_on() -> bool:
     return val != "ON"  # OFF or missing = kill switch engaged = no trading
 
 
+# ============================================================
+# Followed positions operations
+# ============================================================
+
+def get_followed_open_positions(wallet: str) -> list:
+    """Get all OPEN positions we're tracking for a trader."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM followed_positions
+                WHERE proxy_wallet = %s AND status = 'OPEN'
+            """, (wallet,))
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def upsert_followed_position(position: dict):
+    """Insert or update a followed position."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO followed_positions (
+                    proxy_wallet, asset_id, condition_id, title, slug,
+                    outcome, outcome_index, size, avg_price, entry_price,
+                    current_price, current_value, pre_existing, status, last_updated
+                ) VALUES (
+                    %(proxy_wallet)s, %(asset_id)s, %(condition_id)s, %(title)s, %(slug)s,
+                    %(outcome)s, %(outcome_index)s, %(size)s, %(avg_price)s, %(entry_price)s,
+                    %(current_price)s, %(current_value)s, %(pre_existing)s, 'OPEN', NOW()
+                )
+                ON CONFLICT (proxy_wallet, asset_id) DO UPDATE SET
+                    current_price = EXCLUDED.current_price,
+                    current_value = EXCLUDED.current_value,
+                    size = EXCLUDED.size,
+                    last_updated = NOW()
+            """, position)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_position_closed(wallet: str, asset_id: str):
+    """Mark a position as closed (trader exited or market resolved)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE followed_positions
+                SET status = 'CLOSED', closed_at = NOW()
+                WHERE proxy_wallet = %s AND asset_id = %s AND status = 'OPEN'
+            """, (wallet, asset_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_closed_followed_position(wallet: str, asset_id: str) -> dict:
+    """Get a specific position (for exit alert details)."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM followed_positions
+                WHERE proxy_wallet = %s AND asset_id = %s
+            """, (wallet, asset_id))
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def has_baseline_snapshot(wallet: str) -> bool:
+    """Check if we've ever recorded positions for this trader."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM followed_positions WHERE proxy_wallet = %s
+                )
+            """, (wallet,))
+            return cur.fetchone()[0]
+    finally:
+        conn.close()
+
+
 def log_alert(alert_type: str, payload: dict):
     """Log an alert that was sent."""
     conn = get_conn()

@@ -20,8 +20,6 @@ from config import (
 )
 from db import (
     get_followed_traders,
-    get_latest_positions,
-    save_position_snapshot,
     log_copy_trade,
     is_kill_switch_on,
     get_config,
@@ -36,39 +34,105 @@ client = PolymarketClient()
 # Position delta detection
 # ============================================================
 
-def detect_new_positions(wallet: str) -> list:
+def detect_new_positions(wallet: str, username: str = "") -> tuple:
     """
-    Compare current positions with last snapshot.
-    Returns list of NEW positions (not seen in previous snapshot).
-    On first ever poll for a trader, saves baseline and returns empty list.
+    Compare current positions against followed_positions table.
+    Returns (new_entries, exits) where:
+      - new_entries: list of positions the trader just entered (not pre-existing)
+      - exits: list of positions the trader just exited
     """
+    from db import (
+        get_followed_open_positions,
+        upsert_followed_position,
+        mark_position_closed,
+        has_baseline_snapshot,
+    )
+
     # Get current positions from API
     current = client.get_positions(wallet, size_threshold=10)
-    if not current:
-        return []
+    if current is None:
+        return [], []
 
-    # Get last snapshot from DB
-    previous = get_latest_positions(wallet)
+    current_assets = {pos.get("asset", ""): pos for pos in current if pos.get("asset")}
 
-    # First snapshot ever for this trader — save baseline, don't alert
-    if not previous:
-        save_position_snapshot(wallet, current)
-        print(f"[POLL] {wallet[:10]}: First snapshot saved ({len(current)} positions), no alerts")
-        return []
+    # Check if this is the first time we're seeing this trader
+    has_baseline = has_baseline_snapshot(wallet)
 
-    prev_assets = {p["asset_id"] for p in previous}
+    if not has_baseline:
+        # First time — save all current positions as pre-existing baseline
+        for pos in current:
+            asset_id = pos.get("asset", "")
+            if not asset_id:
+                continue
+            upsert_followed_position({
+                "proxy_wallet": wallet,
+                "asset_id": asset_id,
+                "condition_id": pos.get("conditionId", ""),
+                "title": pos.get("title", ""),
+                "slug": pos.get("slug", ""),
+                "outcome": pos.get("outcome", ""),
+                "outcome_index": pos.get("outcomeIndex", 0),
+                "size": pos.get("size", 0),
+                "avg_price": pos.get("avgPrice", 0),
+                "entry_price": pos.get("curPrice", 0),
+                "current_price": pos.get("curPrice", 0),
+                "current_value": pos.get("currentValue", 0),
+                "pre_existing": True,
+            })
+        print(f"[POLL] {username or wallet[:10]}: Baseline saved ({len(current)} positions), no alerts")
+        return [], []
 
-    # Find new positions
-    new_positions = []
-    for pos in current:
-        asset_id = pos.get("asset", "")
-        if asset_id and asset_id not in prev_assets:
-            new_positions.append(pos)
+    # Get what we're currently tracking
+    tracked = get_followed_open_positions(wallet)
+    tracked_assets = {p["asset_id"]: p for p in tracked}
 
-    # Save current snapshot
-    save_position_snapshot(wallet, current)
+    # Detect NEW entries (in API but not tracked)
+    new_entries = []
+    for asset_id, pos in current_assets.items():
+        if asset_id not in tracked_assets:
+            # New position — save and flag as entry
+            upsert_followed_position({
+                "proxy_wallet": wallet,
+                "asset_id": asset_id,
+                "condition_id": pos.get("conditionId", ""),
+                "title": pos.get("title", ""),
+                "slug": pos.get("slug", ""),
+                "outcome": pos.get("outcome", ""),
+                "outcome_index": pos.get("outcomeIndex", 0),
+                "size": pos.get("size", 0),
+                "avg_price": pos.get("avgPrice", 0),
+                "entry_price": pos.get("curPrice", 0),
+                "current_price": pos.get("curPrice", 0),
+                "current_value": pos.get("currentValue", 0),
+                "pre_existing": False,
+            })
+            new_entries.append(pos)
+        else:
+            # Existing position — update current price/value
+            upsert_followed_position({
+                "proxy_wallet": wallet,
+                "asset_id": asset_id,
+                "condition_id": pos.get("conditionId", ""),
+                "title": pos.get("title", ""),
+                "slug": pos.get("slug", ""),
+                "outcome": pos.get("outcome", ""),
+                "outcome_index": pos.get("outcomeIndex", 0),
+                "size": pos.get("size", 0),
+                "avg_price": pos.get("avgPrice", 0),
+                "entry_price": tracked_assets[asset_id].get("entry_price", 0),
+                "current_price": pos.get("curPrice", 0),
+                "current_value": pos.get("currentValue", 0),
+                "pre_existing": tracked_assets[asset_id].get("pre_existing", False),
+            })
 
-    return new_positions
+    # Detect EXITS (tracked but not in current API response)
+    exits = []
+    for asset_id, tracked_pos in tracked_assets.items():
+        if asset_id not in current_assets:
+            mark_position_closed(wallet, asset_id)
+            exits.append(tracked_pos)
+
+    return new_entries, exits
 
 
 # ============================================================
@@ -177,6 +241,16 @@ def send_alert(alert_type: str, payload: dict):
             f"Open positions: {payload.get('open_positions', 0)}\n"
             f"Daily PnL: ${payload.get('daily_pnl', 0):.2f}\n"
             f"Followed traders: {payload.get('followed_count', 0)}"
+        )
+    elif alert_type == "POSITION_EXIT":
+        webhook_data["subject"] = f"Exit: {payload.get('source_username', 'unknown')} left {payload.get('title', 'unknown')}"
+        webhook_data["body"] = (
+            f"Position Exit Detected\n"
+            f"Trader: {payload.get('source_username', 'unknown')}\n"
+            f"Market: {payload.get('title', 'unknown')}\n"
+            f"Outcome: {payload.get('outcome', '?')}\n"
+            f"Entry Price: {payload.get('entry_price', '?')}\n"
+            f"Pre-existing: {payload.get('pre_existing', False)}"
         )
     elif alert_type == "CIRCUIT_BREAKER":
         webhook_data["subject"] = "ALERT: Circuit Breaker Triggered"
@@ -321,14 +395,23 @@ def poll_followed_traders(dry_run: bool = True):
         wallet = trader["proxy_wallet"]
         username = trader.get("username", wallet[:10])
 
-        new_positions = detect_new_positions(wallet)
+        new_entries, exits = detect_new_positions(wallet, username)
 
-        if new_positions:
-            print(f"[POLL] {username}: {len(new_positions)} new position(s) detected!")
-            for pos in new_positions:
+        if new_entries:
+            print(f"[POLL] {username}: {len(new_entries)} new entry(s) detected!")
+            for pos in new_entries:
                 execute_copy_trade(trader, pos, dry_run=dry_run)
-        else:
-            pass  # no new positions, silent
+
+        if exits:
+            print(f"[POLL] {username}: {len(exits)} exit(s) detected!")
+            for pos in exits:
+                send_alert("POSITION_EXIT", {
+                    "source_username": username,
+                    "title": pos.get("title", "unknown"),
+                    "outcome": pos.get("outcome", "?"),
+                    "entry_price": float(pos.get("entry_price", 0)),
+                    "pre_existing": pos.get("pre_existing", False),
+                })
 
     print(f"[POLL] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
 

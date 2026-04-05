@@ -110,6 +110,45 @@ CREATE TABLE IF NOT EXISTS scoring_history (
 CREATE INDEX IF NOT EXISTS idx_scoring_history_wallet ON scoring_history(proxy_wallet, scored_at DESC);
 
 -- ============================================================
+-- FOLLOWED_POSITIONS: Living record of positions held by followed traders
+-- Not snapshots — tracks current state with entry/exit detection
+-- ============================================================
+CREATE TABLE IF NOT EXISTS followed_positions (
+    id              SERIAL PRIMARY KEY,
+    proxy_wallet    VARCHAR(42) NOT NULL,
+    asset_id        TEXT NOT NULL,
+    condition_id    VARCHAR(66) NOT NULL,
+    title           TEXT,
+    slug            TEXT,
+    outcome         VARCHAR(100),
+    outcome_index   INTEGER,
+
+    -- Entry data
+    size            NUMERIC(18,6),
+    avg_price       NUMERIC(10,6),
+    entry_price     NUMERIC(10,6),        -- price when we first detected it
+
+    -- Current data (updated each poll)
+    current_price   NUMERIC(10,6),
+    current_value   NUMERIC(18,2),
+
+    -- Tracking
+    pre_existing    BOOLEAN DEFAULT FALSE, -- TRUE = was there before we started following
+    status          VARCHAR(20) DEFAULT 'OPEN',  -- OPEN, CLOSED
+
+    -- Timestamps
+    detected_at     TIMESTAMPTZ DEFAULT NOW(),   -- when we first saw this position
+    closed_at       TIMESTAMPTZ,                 -- when position disappeared
+    last_updated    TIMESTAMPTZ DEFAULT NOW(),
+
+    UNIQUE(proxy_wallet, asset_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_followed_positions_wallet ON followed_positions(proxy_wallet);
+CREATE INDEX IF NOT EXISTS idx_followed_positions_status ON followed_positions(status);
+CREATE INDEX IF NOT EXISTS idx_followed_positions_open ON followed_positions(proxy_wallet, status) WHERE status = 'OPEN';
+
+-- ============================================================
 -- SYSTEM_CONFIG: Runtime configuration (kill switch, etc.)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS system_config (
