@@ -212,26 +212,23 @@ def send_alert(alert_type: str, payload: dict):
         "payload": payload,
     }
 
-    if alert_type == "NEW_TRADE":
-        webhook_data["subject"] = f"Copy Trade: {payload.get('market_title', 'unknown')}"
+    if alert_type == "BATCH_ENTRY":
+        webhook_data["subject"] = f"{payload.get('source_username', 'unknown')}: {payload.get('count', 0)} new position(s)"
         webhook_data["body"] = (
-            f"Copy Trade Executed\n"
+            f"New Positions Detected\n"
             f"Trader: {payload.get('source_username', 'unknown')}\n"
-            f"Market: {payload.get('market_title', 'unknown')}\n"
-            f"Side: {payload.get('outcome', '?')} @ {payload.get('entry_price', '?')}\n"
-            f"Size: ${payload.get('size_usd', 0):.2f}\n"
-            f"Trader Score: {payload.get('composite_score', '?')}\n"
-            f"Dry Run: {payload.get('dry_run', False)}"
+            f"Count: {payload.get('count', 0)}\n"
+            f"{'='*40}\n"
+            f"{payload.get('entries', '')}"
         )
-    elif alert_type == "NEW_POSITION_DETECTED":
-        webhook_data["subject"] = f"New Position: {payload.get('source_username', 'unknown')}"
+    elif alert_type == "BATCH_EXIT":
+        webhook_data["subject"] = f"{payload.get('source_username', 'unknown')}: {payload.get('count', 0)} exit(s)"
         webhook_data["body"] = (
-            f"New Position Detected (alert only)\n"
+            f"Position Exits Detected\n"
             f"Trader: {payload.get('source_username', 'unknown')}\n"
-            f"Market: {payload.get('title', 'unknown')}\n"
-            f"Outcome: {payload.get('outcome', '?')}\n"
-            f"Shares: {payload.get('size', 0):.1f} @ {payload.get('avg_price', 0):.4f}\n"
-            f"Kill switch is OFF"
+            f"Count: {payload.get('count', 0)}\n"
+            f"{'='*40}\n"
+            f"{payload.get('exits', '')}"
         )
     elif alert_type == "DAILY_SUMMARY":
         webhook_data["subject"] = "Polymarket Copy Trader - Daily Summary"
@@ -241,16 +238,6 @@ def send_alert(alert_type: str, payload: dict):
             f"Open positions: {payload.get('open_positions', 0)}\n"
             f"Daily PnL: ${payload.get('daily_pnl', 0):.2f}\n"
             f"Followed traders: {payload.get('followed_count', 0)}"
-        )
-    elif alert_type == "POSITION_EXIT":
-        webhook_data["subject"] = f"Exit: {payload.get('source_username', 'unknown')} left {payload.get('title', 'unknown')}"
-        webhook_data["body"] = (
-            f"Position Exit Detected\n"
-            f"Trader: {payload.get('source_username', 'unknown')}\n"
-            f"Market: {payload.get('title', 'unknown')}\n"
-            f"Outcome: {payload.get('outcome', '?')}\n"
-            f"Entry Price: {payload.get('entry_price', '?')}\n"
-            f"Pre-existing: {payload.get('pre_existing', False)}"
         )
     elif alert_type == "CIRCUIT_BREAKER":
         webhook_data["subject"] = "ALERT: Circuit Breaker Triggered"
@@ -383,6 +370,7 @@ def execute_copy_trade(
 def poll_followed_traders(dry_run: bool = True):
     """
     Single poll cycle: check all followed traders for new positions.
+    Sends batched alerts — one per trader per cycle, not one per position.
     """
     followed = get_followed_traders()
     if not followed:
@@ -397,21 +385,39 @@ def poll_followed_traders(dry_run: bool = True):
 
         new_entries, exits = detect_new_positions(wallet, username)
 
+        # Send ONE batched entry alert per trader (not per position)
         if new_entries:
             print(f"[POLL] {username}: {len(new_entries)} new entry(s) detected!")
-            for pos in new_entries:
-                execute_copy_trade(trader, pos, dry_run=dry_run)
 
+            entry_lines = []
+            for pos in new_entries:
+                title = pos.get("title", "unknown")
+                outcome = pos.get("outcome", "?")
+                price = pos.get("curPrice", 0)
+                entry_lines.append(f"  - {outcome} @ {price} — {title}")
+
+            send_alert("BATCH_ENTRY", {
+                "source_username": username,
+                "count": len(new_entries),
+                "entries": "\n".join(entry_lines),
+            })
+
+        # Send ONE batched exit alert per trader
         if exits:
             print(f"[POLL] {username}: {len(exits)} exit(s) detected!")
+
+            exit_lines = []
             for pos in exits:
-                send_alert("POSITION_EXIT", {
-                    "source_username": username,
-                    "title": pos.get("title", "unknown"),
-                    "outcome": pos.get("outcome", "?"),
-                    "entry_price": float(pos.get("entry_price", 0)),
-                    "pre_existing": pos.get("pre_existing", False),
-                })
+                title = pos.get("title", "unknown")
+                outcome = pos.get("outcome", "?")
+                pre_existing = pos.get("pre_existing", False)
+                exit_lines.append(f"  - {outcome} — {title} (pre-existing: {pre_existing})")
+
+            send_alert("BATCH_EXIT", {
+                "source_username": username,
+                "count": len(exits),
+                "exits": "\n".join(exit_lines),
+            })
 
     print(f"[POLL] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
 

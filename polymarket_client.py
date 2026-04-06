@@ -105,6 +105,7 @@ class PolymarketClient:
                 "sizeThreshold": size_threshold,
                 "sortBy": "CURRENT",
                 "sortDirection": "DESC",
+                "limit": 500,
             }
         )
         return data if isinstance(data, list) else []
