@@ -100,6 +100,13 @@ ALLOCATION_ROI_WEIGHT = 0.5      # 50% weight to ROI in allocation calc
 ACCOUNT_BALANCE_USD = 1000.0     # starting account balance (will be dynamic later)
 
 # ============================================================
+# Polymarket CLOB (order execution)
+# ============================================================
+POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
+POLYMARKET_CHAIN_ID = 137           # Polygon
+POLYMARKET_SIGNATURE_TYPE = 1       # 1 = Magic/email wallet
+
+# ============================================================
 # Polymarket authentication (for order placement)
 # ============================================================
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")

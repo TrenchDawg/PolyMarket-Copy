@@ -10,6 +10,9 @@ import requests
 from datetime import datetime, timezone, date
 from typing import Optional
 from polymarket_client import PolymarketClient
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
 from config import (
     DEFAULT_PORTFOLIO_FRACTION,
     MAX_POSITION_USD,
@@ -20,6 +23,11 @@ from config import (
     MAX_POSITION_PCT,
     MIN_POSITION_CONTRACTS,
     ACCOUNT_BALANCE_USD,
+    POLYMARKET_CLOB_HOST,
+    POLYMARKET_CHAIN_ID,
+    POLYMARKET_SIGNATURE_TYPE,
+    POLY_PRIVATE_KEY,
+    POLY_WALLET_ADDRESS,
 )
 from db import (
     get_followed_traders,
@@ -32,6 +40,79 @@ from db import (
 
 
 client = PolymarketClient()
+
+
+# ============================================================
+# CLOB client (order execution)
+# ============================================================
+
+_clob_client = None
+
+
+def get_clob_client() -> Optional[ClobClient]:
+    """Get an authenticated CLOB client. Initializes on first call."""
+    global _clob_client
+    if _clob_client is not None:
+        return _clob_client
+
+    if not POLY_PRIVATE_KEY or not POLY_WALLET_ADDRESS:
+        print("[CLOB] No private key or wallet address configured. Cannot place orders.")
+        return None
+
+    try:
+        clob = ClobClient(
+            host=POLYMARKET_CLOB_HOST,
+            key=POLY_PRIVATE_KEY,
+            chain_id=POLYMARKET_CHAIN_ID,
+            signature_type=POLYMARKET_SIGNATURE_TYPE,
+            funder=POLY_WALLET_ADDRESS,
+        )
+        clob.set_api_creds(clob.create_or_derive_api_creds())
+        print("[CLOB] Authenticated successfully")
+        _clob_client = clob
+        return clob
+    except Exception as e:
+        print(f"[CLOB] Authentication failed: {e}")
+        return None
+
+
+def place_copy_order(
+    token_id: str,
+    side: str,
+    amount_usd: float,
+    title: str = "",
+) -> Optional[dict]:
+    """
+    Place a FOK market order on Polymarket.
+
+    For BUY orders, amount_usd is dollars to spend.
+    For SELL orders, amount_usd is shares (contracts) to sell.
+    Returns the order response dict, or None on failure.
+    """
+    clob = get_clob_client()
+    if clob is None:
+        print(f"[ORDER] Cannot place order — CLOB client not initialized")
+        return None
+
+    try:
+        order_side = BUY if side == "BUY" else SELL
+        mo = MarketOrderArgs(
+            token_id=token_id,
+            amount=amount_usd,
+            side=order_side,
+        )
+        signed_order = clob.create_market_order(mo)
+        resp = clob.post_order(signed_order, OrderType.FOK)
+        print(f"[ORDER] {side} ${amount_usd:.2f} on '{title}' — Response: {resp}")
+        return resp
+    except Exception as e:
+        print(f"[ORDER] Failed to place {side} ${amount_usd:.2f} on '{title}': {e}")
+        return None
+
+
+def place_exit_order(token_id: str, shares: float, title: str = "") -> Optional[dict]:
+    """Sell/exit a position by selling all shares."""
+    return place_copy_order(token_id=token_id, side="SELL", amount_usd=shares, title=title)
 
 
 # ============================================================
@@ -418,7 +499,7 @@ def execute_copy_trade(
 def poll_followed_traders(dry_run: bool = True):
     """
     Single poll cycle: check all followed traders for new positions.
-    Sends batched alerts — one per trader per cycle, not one per position.
+    If kill switch is ON and dry_run is False, executes real trades.
     """
     followed = get_followed_traders()
     if not followed:
@@ -427,13 +508,16 @@ def poll_followed_traders(dry_run: bool = True):
 
     print(f"[POLL] Checking {len(followed)} followed traders...")
 
+    # is_kill_switch_on() returns True when trading is DISABLED (kill switch engaged)
+    # We want live_trading = True when kill switch is OFF (trading allowed)
+    live_trading = not is_kill_switch_on() and not dry_run
+
     for trader in followed:
         wallet = trader["proxy_wallet"]
         username = trader.get("username", wallet[:10])
 
         new_entries, exits = detect_new_positions(wallet, username)
 
-        # Send ONE batched entry alert per trader (not per position)
         if new_entries:
             print(f"[POLL] {username}: {len(new_entries)} new entry(s) detected!")
 
@@ -442,16 +526,51 @@ def poll_followed_traders(dry_run: bool = True):
                 title = pos.get("title", "unknown")
                 outcome = pos.get("outcome", "?")
                 price = pos.get("curPrice", 0)
+                token_id = pos.get("asset", "")
                 size_usd = calculate_copy_position_size(trader, pos, ACCOUNT_BALANCE_USD)
-                entry_lines.append(f"  - {outcome} @ {price} — {title} [Size: ${size_usd:.2f}]")
+
+                order_result = None
+                if live_trading and token_id:
+                    order_result = place_copy_order(
+                        token_id=token_id,
+                        side="BUY",
+                        amount_usd=size_usd,
+                        title=title,
+                    )
+                    if order_result:
+                        log_copy_trade({
+                            "source_wallet": wallet,
+                            "source_username": username,
+                            "condition_id": pos.get("conditionId", ""),
+                            "token_id": token_id,
+                            "market_title": title,
+                            "market_slug": pos.get("slug", ""),
+                            "outcome": outcome,
+                            "side": "BUY",
+                            "entry_price": price,
+                            "size_usd": size_usd,
+                            "shares": size_usd / price if price > 0 else 0,
+                            "order_id": str(order_result.get("orderID", "")),
+                        })
+
+                if order_result:
+                    status = "EXECUTED"
+                elif live_trading:
+                    status = "FAILED"
+                else:
+                    status = "ALERT ONLY"
+
+                entry_lines.append(
+                    f"  - {outcome} @ {price} — {title} [Size: ${size_usd:.2f}] [{status}]"
+                )
 
             send_alert("BATCH_ENTRY", {
                 "source_username": username,
                 "count": len(new_entries),
                 "entries": "\n".join(entry_lines),
+                "live_trading": live_trading,
             })
 
-        # Send ONE batched exit alert per trader
         if exits:
             print(f"[POLL] {username}: {len(exits)} exit(s) detected!")
 
@@ -460,6 +579,13 @@ def poll_followed_traders(dry_run: bool = True):
                 title = pos.get("title", "unknown")
                 outcome = pos.get("outcome", "?")
                 pre_existing = pos.get("pre_existing", False)
+                token_id = pos.get("asset_id", "")
+
+                # Only exit positions we actually entered (not pre-existing)
+                # TODO: look up shares from copy_trades table and call place_exit_order()
+                if live_trading and not pre_existing and token_id:
+                    pass  # exit execution wired up once copy_trades lookup is implemented
+
                 exit_lines.append(f"  - {outcome} — {title} (pre-existing: {pre_existing})")
 
             send_alert("BATCH_EXIT", {
