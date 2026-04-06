@@ -91,6 +91,15 @@ DATABASE_URL = os.getenv(
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
 
 # ============================================================
+# Position allocation
+# ============================================================
+MAX_POSITION_PCT = 0.15          # max 15% of account on any single trade
+MIN_POSITION_CONTRACTS = 1       # minimum 1 contract per trade
+ALLOCATION_SHARPE_WEIGHT = 0.5   # 50% weight to consistency in allocation calc
+ALLOCATION_ROI_WEIGHT = 0.5      # 50% weight to ROI in allocation calc
+ACCOUNT_BALANCE_USD = 1000.0     # starting account balance (will be dynamic later)
+
+# ============================================================
 # Polymarket authentication (for order placement)
 # ============================================================
 POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")

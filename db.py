@@ -340,6 +340,20 @@ def has_baseline_snapshot(wallet: str) -> bool:
         conn.close()
 
 
+def get_trader_allocation(wallet: str) -> float:
+    """Get a trader's portfolio allocation percentage (0.0 to 1.0)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT allocation_pct FROM traders WHERE proxy_wallet = %s
+            """, (wallet,))
+            row = cur.fetchone()
+            return float(row[0]) if row and row[0] else 0.0
+    finally:
+        conn.close()
+
+
 def log_alert(alert_type: str, payload: dict):
     """Log an alert that was sent."""
     conn = get_conn()

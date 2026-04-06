@@ -17,6 +17,9 @@ from config import (
     MIN_LIQUIDITY_USD,
     MAX_SPREAD_PCT,
     ALERT_WEBHOOK_URL,
+    MAX_POSITION_PCT,
+    MIN_POSITION_CONTRACTS,
+    ACCOUNT_BALANCE_USD,
 )
 from db import (
     get_followed_traders,
@@ -24,6 +27,7 @@ from db import (
     is_kill_switch_on,
     get_config,
     log_alert,
+    get_trader_allocation,
 )
 
 
@@ -193,6 +197,50 @@ def calculate_position_size(portfolio_value: float) -> float:
     max_usd = float(get_config("max_position_usd") or MAX_POSITION_USD)
     size = portfolio_value * fraction
     return min(size, max_usd)
+
+
+def calculate_copy_position_size(
+    trader: dict,
+    position: dict,
+    account_balance: float,
+) -> float:
+    """
+    Calculate how much to invest in a copy trade.
+
+    Step 1: trader_allocation = account_balance × trader's allocation_pct
+    Step 2: trader_position_pct = position_value / trader_total_positions_value
+    Step 3: our_position_size = trader_allocation × trader_position_pct
+    Step 4: cap at MAX_POSITION_PCT of account, floor at MIN_POSITION_CONTRACTS
+    """
+    # Step 1: How much of our account is allocated to this trader
+    allocation_pct = get_trader_allocation(trader["proxy_wallet"])
+    trader_allocation = account_balance * allocation_pct
+
+    # Step 2: What % of the trader's portfolio is this position
+    position_value = float(position.get("size", 0)) * float(position.get("curPrice", 0))
+
+    trader_positions_value = float(trader.get("positions_value", 0))
+    if trader_positions_value <= 0:
+        trader_positions_value = client.get_portfolio_value_usd(trader["proxy_wallet"])
+
+    if trader_positions_value > 0:
+        trader_position_pct = position_value / trader_positions_value
+    else:
+        trader_position_pct = 0.10  # default 10%
+
+    # Step 3: Our position size
+    our_position_size = trader_allocation * trader_position_pct
+
+    # Step 4: Apply caps
+    max_size = account_balance * MAX_POSITION_PCT
+    our_position_size = min(our_position_size, max_size)
+
+    # Floor: at least enough for 1 contract at current price
+    cur_price = float(position.get("curPrice", 0.50))
+    min_size = cur_price * MIN_POSITION_CONTRACTS
+    our_position_size = max(our_position_size, min_size)
+
+    return round(our_position_size, 2)
 
 
 # ============================================================
@@ -394,7 +442,8 @@ def poll_followed_traders(dry_run: bool = True):
                 title = pos.get("title", "unknown")
                 outcome = pos.get("outcome", "?")
                 price = pos.get("curPrice", 0)
-                entry_lines.append(f"  - {outcome} @ {price} — {title}")
+                size_usd = calculate_copy_position_size(trader, pos, ACCOUNT_BALANCE_USD)
+                entry_lines.append(f"  - {outcome} @ {price} — {title} [Size: ${size_usd:.2f}]")
 
             send_alert("BATCH_ENTRY", {
                 "source_username": username,

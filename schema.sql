@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS copy_trades (
 CREATE INDEX IF NOT EXISTS idx_copy_trades_status ON copy_trades(status);
 CREATE INDEX IF NOT EXISTS idx_copy_trades_source ON copy_trades(source_wallet);
 
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'traders' AND column_name = 'allocation_pct') THEN
+        ALTER TABLE traders ADD COLUMN allocation_pct NUMERIC(6,4) DEFAULT 0;
+    END IF;
+END $$;
+
 -- ============================================================
 -- SCORING_HISTORY: Track how trader scores change over time
 -- ============================================================
