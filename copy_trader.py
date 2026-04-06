@@ -10,9 +10,8 @@ import requests
 from datetime import datetime, timezone, date
 from typing import Optional
 from polymarket_client import PolymarketClient
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+# py_clob_client imports are lazy-loaded inside get_clob_client() and place_copy_order()
+# to prevent startup crashes if the package has import issues.
 from config import (
     DEFAULT_PORTFOLIO_FRACTION,
     MAX_POSITION_USD,
@@ -49,8 +48,9 @@ client = PolymarketClient()
 _clob_client = None
 
 
-def get_clob_client() -> Optional[ClobClient]:
+def get_clob_client():
     """Get an authenticated CLOB client. Initializes on first call."""
+    from py_clob_client.client import ClobClient
     global _clob_client
     if _clob_client is not None:
         return _clob_client
@@ -89,6 +89,8 @@ def place_copy_order(
     For SELL orders, amount_usd is shares (contracts) to sell.
     Returns the order response dict, or None on failure.
     """
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY, SELL
     clob = get_clob_client()
     if clob is None:
         print(f"[ORDER] Cannot place order — CLOB client not initialized")
