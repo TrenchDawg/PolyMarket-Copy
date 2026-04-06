@@ -12,6 +12,9 @@ Usage:
   python main.py --score-only     # just run the scorer once and exit
   python main.py --poll-only      # just run one poll cycle and exit
 """
+
+print("[DEBUG] main.py starting...")
+
 import sys
 import signal
 from datetime import datetime, timezone
