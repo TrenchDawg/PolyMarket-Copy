@@ -48,6 +48,7 @@ LEADERBOARD_MAX_PAGES = 6        # 50 * 6 = 300 traders per period
 RANKING_INTERVAL_HOURS = 24      # re-score traders every 24 hours
 POSITION_POLL_MINUTES = 3        # check followed traders every 3 minutes
 ALERT_SUMMARY_HOUR = 20          # daily summary at 8pm
+ALERT_COOLDOWN_MINUTES = 30      # min minutes between alerts for same trader
 
 # ============================================================
 # Copy trading parameters

@@ -27,6 +27,7 @@ from config import (
     POLYMARKET_SIGNATURE_TYPE,
     POLY_PRIVATE_KEY,
     POLY_WALLET_ADDRESS,
+    ALERT_COOLDOWN_MINUTES,
 )
 from db import (
     get_followed_traders,
@@ -35,6 +36,9 @@ from db import (
     get_config,
     log_alert,
     get_trader_allocation,
+    should_send_alert,
+    update_last_alert,
+    seconds_until_alert,
 )
 
 
@@ -341,6 +345,7 @@ def send_alert(alert_type: str, payload: dict):
     webhook_data = {
         "alert_type": alert_type,
         "payload": payload,
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
     if alert_type == "BATCH_ENTRY":
@@ -566,12 +571,18 @@ def poll_followed_traders(dry_run: bool = True):
                     f"  - {outcome} @ {price} — {title} [Size: ${size_usd:.2f}] [{status}]"
                 )
 
-            send_alert("BATCH_ENTRY", {
-                "source_username": username,
-                "count": len(new_entries),
-                "entries": "\n".join(entry_lines),
-                "live_trading": live_trading,
-            })
+            if should_send_alert(wallet, ALERT_COOLDOWN_MINUTES):
+                send_alert("BATCH_ENTRY", {
+                    "source_username": username,
+                    "count": len(new_entries),
+                    "entries": "\n".join(entry_lines),
+                    "live_trading": live_trading,
+                })
+                update_last_alert(wallet)
+                print(f"[POLL] {username}: entry alert sent")
+            else:
+                remaining = seconds_until_alert(wallet, ALERT_COOLDOWN_MINUTES)
+                print(f"[POLL] {username}: entry alert suppressed — cooldown {remaining // 60} min remaining")
 
         if exits:
             print(f"[POLL] {username}: {len(exits)} exit(s) detected!")
@@ -590,11 +601,17 @@ def poll_followed_traders(dry_run: bool = True):
 
                 exit_lines.append(f"  - {outcome} — {title} (pre-existing: {pre_existing})")
 
-            send_alert("BATCH_EXIT", {
-                "source_username": username,
-                "count": len(exits),
-                "exits": "\n".join(exit_lines),
-            })
+            if should_send_alert(wallet, ALERT_COOLDOWN_MINUTES):
+                send_alert("BATCH_EXIT", {
+                    "source_username": username,
+                    "count": len(exits),
+                    "exits": "\n".join(exit_lines),
+                })
+                update_last_alert(wallet)
+                print(f"[POLL] {username}: exit alert sent")
+            else:
+                remaining = seconds_until_alert(wallet, ALERT_COOLDOWN_MINUTES)
+                print(f"[POLL] {username}: exit alert suppressed — cooldown {remaining // 60} min remaining")
 
     print(f"[POLL] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
 

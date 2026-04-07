@@ -4,7 +4,6 @@ Polymarket Copy Trader — Trader Ranking Engine
 Scores traders using a weighted composite of:
   Consistency (35%) + Win Rate (30%) + ROI (20%) + Recency (15%)
 """
-import math
 import statistics
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -19,6 +18,7 @@ from config import (
     MIN_RECENT_WIN_RATE,
     MIN_POSITIONS_VALUE,
     MIN_ROI,
+    MIN_RECENT_POSITIONS,
     MIN_RECENT_TRADES_PER_DAY,
     LEADERBOARD_CATEGORIES,
     LEADERBOARD_TIME_PERIODS,
@@ -224,7 +224,8 @@ def compute_consistency(closed_positions: list) -> float:
 def compute_recency(trades: list) -> tuple:
     """
     Returns (recency_score, days_since_last_trade).
-    recency = exp(-0.1 * days_since_last_trade)
+    recency = max(0, 1.0 - days_since / MAX_DAYS_SINCE_LAST_TRADE)
+    0 days ago = 1.0, MAX_DAYS_SINCE_LAST_TRADE days ago = 0.0.
     Returns (0.0, inf) if no trades or too old.
     """
     if not trades:
@@ -251,7 +252,7 @@ def compute_recency(trades: list) -> tuple:
     if days_ago > MAX_DAYS_SINCE_LAST_TRADE:
         return 0.0, days_ago
 
-    return math.exp(-0.1 * days_ago), days_ago
+    return max(0.0, 1.0 - (days_ago / MAX_DAYS_SINCE_LAST_TRADE)), days_ago
 
 
 # ============================================================
@@ -459,8 +460,8 @@ def score_all_traders(follow_top_n: int = 10):
     scored_traders = []
     skipped = {
         "pnl": 0, "vol": 0, "no_value": 0, "health": 0,
-        "positions": 0, "frequency": 0, "win_rate": 0, "roi": 0,
-        "recency": 0, "lb_month": 0, "lb_all": 0,
+        "positions": 0, "recent_positions": 0, "frequency": 0,
+        "win_rate": 0, "roi": 0, "recency": 0, "lb_month": 0, "lb_all": 0,
     }
 
     for i, (wallet, leaderboard_data) in enumerate(discovered.items()):
@@ -503,6 +504,11 @@ def score_all_traders(follow_top_n: int = 10):
         # Step 4d: Frequency + recent win rate
         recent_closed, older_closed = split_by_recency(closed, RECENT_WINDOW_DAYS)
 
+        # Filter #10: Minimum recent closed positions
+        if len(recent_closed) < MIN_RECENT_POSITIONS:
+            skipped["recent_positions"] += 1
+            continue
+
         # Frequency check: must average at least MIN_RECENT_TRADES_PER_DAY in last 30 days
         trades_per_day = len(recent_closed) / RECENT_WINDOW_DAYS
         if trades_per_day < MIN_RECENT_TRADES_PER_DAY:
@@ -522,18 +528,23 @@ def score_all_traders(follow_top_n: int = 10):
             continue
 
         # Step 5-6: Per-trader MONTH/ALL leaderboard (only ~50-100 traders reach here)
+        # NOTE: fallback is 0.0 (not total_pnl) so a missing/null response boots the trader
         lb_month = client.get_leaderboard_for_user(wallet, "MONTH")
         lb_all = client.get_leaderboard_for_user(wallet, "ALL")
 
-        month_pnl = float(lb_month.get("pnl", 0)) if lb_month else total_pnl
-        all_pnl = float(lb_all.get("pnl", 0)) if lb_all else total_pnl
+        month_pnl = float(lb_month.get("pnl", 0)) if lb_month else 0.0
+        all_pnl = float(lb_all.get("pnl", 0)) if lb_all else 0.0
 
-        if all_pnl < 0:
-            skipped["lb_all"] += 1
-            continue
-        if month_pnl < 0:
+        username_log = leaderboard_data.get("userName", wallet[:10])
+        if month_pnl <= 0:
+            print(f"  [BOOT] {username_log}: MONTH PnL = ${month_pnl:,.0f} (must be > 0)")
             skipped["lb_month"] += 1
             continue
+        if all_pnl <= 0:
+            print(f"  [BOOT] {username_log}: ALL PnL = ${all_pnl:,.0f} (must be > 0)")
+            skipped["lb_all"] += 1
+            continue
+        print(f"  [PASS] {username_log}: MONTH PnL = ${month_pnl:,.0f}, ALL PnL = ${all_pnl:,.0f}")
 
         # Step 7: Blend metrics across recent vs older windows
         recent_roi = compute_roi(recent_closed, total_volume) if recent_closed else 0
@@ -598,7 +609,8 @@ def score_all_traders(follow_top_n: int = 10):
     print(
         f"  Skipped: {skipped['pnl']} neg-PnL, {skipped['vol']} low-vol, "
         f"{skipped['no_value']} no-positions, {skipped['health']} bad-health, "
-        f"{skipped['positions']} few-closed, {skipped['frequency']} low-freq, "
+        f"{skipped['positions']} few-closed, {skipped['recent_positions']} few-recent, "
+        f"{skipped['frequency']} low-freq, "
         f"{skipped['win_rate']} low-WR, {skipped['roi']} low-ROI, "
         f"{skipped['recency']} inactive, {skipped['lb_month']} neg-month, "
         f"{skipped['lb_all']} neg-alltime"

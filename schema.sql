@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS traders (
     last_scored_at  TIMESTAMPTZ,
     first_seen_at   TIMESTAMPTZ DEFAULT NOW(),
     is_followed     BOOLEAN DEFAULT FALSE,  -- are we actively copying this trader?
+    last_alert_at   TIMESTAMPTZ,            -- when we last sent an alert for this trader
 
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW()
@@ -98,6 +99,9 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'traders' AND column_name = 'allocation_pct') THEN
         ALTER TABLE traders ADD COLUMN allocation_pct NUMERIC(6,4) DEFAULT 0;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'traders' AND column_name = 'last_alert_at') THEN
+        ALTER TABLE traders ADD COLUMN last_alert_at TIMESTAMPTZ;
     END IF;
 END $$;
 

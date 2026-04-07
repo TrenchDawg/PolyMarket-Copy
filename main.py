@@ -2,7 +2,7 @@
 Polymarket Copy Trader — Main Scheduler
 
 Runs:
-  1. Trader ranking pipeline every 6 hours
+  1. Trader ranking pipeline every 24 hours
   2. Position polling every 3 minutes
   3. Daily summary alert at 8pm UTC
 
