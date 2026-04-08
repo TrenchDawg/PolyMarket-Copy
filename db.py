@@ -108,23 +108,40 @@ def get_top_traders(limit: int = 10) -> list:
         conn.close()
 
 
-def update_follow_list(top_n: int):
-    """Set is_followed=TRUE for top N traders, FALSE for rest."""
+def update_follow_list(top_n: int, scored_wallets: list = None):
+    """
+    Set is_followed=TRUE for top N traders, FALSE for rest.
+    scored_wallets: if provided, only consider traders from the current scoring run.
+    This prevents stale high-scoring traders (who were dropped from discovery)
+    from staying followed indefinitely via their old composite_score.
+    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             # Unfollow all
             cur.execute("UPDATE traders SET is_followed = FALSE")
-            # Follow top N
-            cur.execute("""
-                UPDATE traders SET is_followed = TRUE
-                WHERE proxy_wallet IN (
-                    SELECT proxy_wallet FROM traders
-                    WHERE composite_score IS NOT NULL
-                    ORDER BY composite_score DESC
-                    LIMIT %s
-                )
-            """, (top_n,))
+            # Follow top N — restricted to current run's scored wallets if provided
+            if scored_wallets:
+                cur.execute("""
+                    UPDATE traders SET is_followed = TRUE
+                    WHERE proxy_wallet IN (
+                        SELECT proxy_wallet FROM traders
+                        WHERE composite_score IS NOT NULL
+                          AND proxy_wallet = ANY(%s)
+                        ORDER BY composite_score DESC
+                        LIMIT %s
+                    )
+                """, (scored_wallets, top_n))
+            else:
+                cur.execute("""
+                    UPDATE traders SET is_followed = TRUE
+                    WHERE proxy_wallet IN (
+                        SELECT proxy_wallet FROM traders
+                        WHERE composite_score IS NOT NULL
+                        ORDER BY composite_score DESC
+                        LIMIT %s
+                    )
+                """, (top_n,))
         conn.commit()
     finally:
         conn.close()

@@ -712,8 +712,9 @@ def score_all_traders(follow_top_n: int = 10):
     finally:
         conn.close()
 
-    # Update follow list
-    update_follow_list(follow_top_n)
+    # Update follow list — pass scored wallets so stale DB records can't win
+    scored_wallet_list = [t["wallet"] for t in scored_traders]
+    update_follow_list(follow_top_n, scored_wallet_list)
 
     # Compute allocation percentages for followed traders
     compute_allocations()
