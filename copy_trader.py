@@ -27,7 +27,6 @@ from config import (
     POLYMARKET_SIGNATURE_TYPE,
     POLY_PRIVATE_KEY,
     POLY_WALLET_ADDRESS,
-    ALERT_COOLDOWN_MINUTES,
 )
 from db import (
     get_followed_traders,
@@ -36,9 +35,6 @@ from db import (
     get_config,
     log_alert,
     get_trader_allocation,
-    should_send_alert,
-    update_last_alert,
-    seconds_until_alert,
 )
 
 
@@ -170,12 +166,13 @@ def detect_new_positions(wallet: str, username: str = "") -> tuple:
                 "current_value": pos.get("currentValue", 0),
                 "pre_existing": True,
             })
-        print(f"[POLL] {username or wallet[:10]}: Baseline saved ({len(current)} positions), no alerts")
+        print(f"[POLL] {username or wallet[:10]}: API={len(current)} positions, DB=0 tracked, baseline saved, new=0, exits=0")
         return [], []
 
     # Get what we're currently tracking
     tracked = get_followed_open_positions(wallet)
     tracked_assets = {p["asset_id"]: p for p in tracked}
+    print(f"[POLL] {username or wallet[:10]}: API={len(current_assets)} positions, DB={len(tracked_assets)} tracked")
 
     # Detect NEW entries (in API but not tracked)
     new_entries = []
@@ -223,6 +220,7 @@ def detect_new_positions(wallet: str, username: str = "") -> tuple:
             mark_position_closed(wallet, asset_id)
             exits.append(tracked_pos)
 
+    print(f"[POLL] {username or wallet[:10]}: new={len(new_entries)}, exits={len(exits)}")
     return new_entries, exits
 
 
@@ -571,18 +569,13 @@ def poll_followed_traders(dry_run: bool = True):
                     f"  - {outcome} @ {price} — {title} [Size: ${size_usd:.2f}] [{status}]"
                 )
 
-            if should_send_alert(wallet, ALERT_COOLDOWN_MINUTES):
-                send_alert("BATCH_ENTRY", {
-                    "source_username": username,
-                    "count": len(new_entries),
-                    "entries": "\n".join(entry_lines),
-                    "live_trading": live_trading,
-                })
-                update_last_alert(wallet)
-                print(f"[POLL] {username}: entry alert sent")
-            else:
-                remaining = seconds_until_alert(wallet, ALERT_COOLDOWN_MINUTES)
-                print(f"[POLL] {username}: entry alert suppressed — cooldown {remaining // 60} min remaining")
+            send_alert("BATCH_ENTRY", {
+                "source_username": username,
+                "count": len(new_entries),
+                "entries": "\n".join(entry_lines),
+                "live_trading": live_trading,
+            })
+            print(f"[POLL] {username}: entry alert sent")
 
         if exits:
             print(f"[POLL] {username}: {len(exits)} exit(s) detected!")
@@ -601,17 +594,12 @@ def poll_followed_traders(dry_run: bool = True):
 
                 exit_lines.append(f"  - {outcome} — {title} (pre-existing: {pre_existing})")
 
-            if should_send_alert(wallet, ALERT_COOLDOWN_MINUTES):
-                send_alert("BATCH_EXIT", {
-                    "source_username": username,
-                    "count": len(exits),
-                    "exits": "\n".join(exit_lines),
-                })
-                update_last_alert(wallet)
-                print(f"[POLL] {username}: exit alert sent")
-            else:
-                remaining = seconds_until_alert(wallet, ALERT_COOLDOWN_MINUTES)
-                print(f"[POLL] {username}: exit alert suppressed — cooldown {remaining // 60} min remaining")
+            send_alert("BATCH_EXIT", {
+                "source_username": username,
+                "count": len(exits),
+                "exits": "\n".join(exit_lines),
+            })
+            print(f"[POLL] {username}: exit alert sent")
 
     print(f"[POLL] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
 

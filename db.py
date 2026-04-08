@@ -289,6 +289,8 @@ def upsert_followed_position(position: dict):
                     current_price = EXCLUDED.current_price,
                     current_value = EXCLUDED.current_value,
                     size = EXCLUDED.size,
+                    status = 'OPEN',
+                    closed_at = NULL,
                     last_updated = NOW()
             """, position)
         conn.commit()
@@ -368,56 +370,3 @@ def log_alert(alert_type: str, payload: dict):
         conn.close()
 
 
-def should_send_alert(wallet: str, cooldown_minutes: int) -> bool:
-    """Return True if enough time has passed since the last alert for this trader."""
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT last_alert_at FROM traders WHERE proxy_wallet = %s",
-                (wallet,)
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
-
-    if not row or not row[0]:
-        return True
-
-    elapsed = datetime.now(timezone.utc) - row[0]
-    return elapsed.total_seconds() >= (cooldown_minutes * 60)
-
-
-def update_last_alert(wallet: str):
-    """Record that we just sent an alert for this trader."""
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE traders SET last_alert_at = NOW() WHERE proxy_wallet = %s",
-                (wallet,)
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def seconds_until_alert(wallet: str, cooldown_minutes: int) -> int:
-    """Return seconds remaining in the cooldown window (0 if no cooldown active)."""
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT last_alert_at FROM traders WHERE proxy_wallet = %s",
-                (wallet,)
-            )
-            row = cur.fetchone()
-    finally:
-        conn.close()
-
-    if not row or not row[0]:
-        return 0
-
-    elapsed = (datetime.now(timezone.utc) - row[0]).total_seconds()
-    remaining = (cooldown_minutes * 60) - elapsed
-    return max(0, int(remaining))
