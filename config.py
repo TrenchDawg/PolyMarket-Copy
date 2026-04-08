@@ -24,20 +24,18 @@ assert abs(sum(SCORING_WEIGHTS.values()) - 1.0) < 0.001, "Weights must sum to 1.
 # ============================================================
 # Trader filters (hard cutoffs before scoring)
 # ============================================================
-MIN_RESOLVED_POSITIONS = 20      # minimum closed trades to be scored
+MIN_RESOLVED_POSITIONS = 30      # minimum closed trades to be scored
 MIN_VOLUME_USD = 500            # minimum total volume (basic dust filter)
-MAX_DAYS_SINCE_LAST_TRADE = 7    # must have traded recently
+MAX_DAYS_SINCE_LAST_TRADE = 14   # must have traded recently
 REQUIRE_POSITIVE_PNL = True      # only score profitable traders
 MIN_RECENT_WIN_RATE = 0.90       # 90% win rate in last 30 days
 MIN_POSITIONS_VALUE = 0.01       # must have live positions worth >$0
 MIN_ROI = 0.01                   # 1% minimum blended ROI
-MIN_RECENT_TRADES_PER_DAY = 0.5  # minimum average trades per day in last 30 days
-MIN_RECENT_POSITIONS = 5         # must have at least 5 closed positions in last 30 days
 
 # ============================================================
 # Leaderboard scraping parameters
 # ============================================================
-LEADERBOARD_CATEGORIES = ["OVERALL"]
+LEADERBOARD_CATEGORIES = ["OVERALL", "POLITICS", "SPORTS", "CRYPTO", "ECONOMICS", "FINANCE", "TECH"]
 LEADERBOARD_TIME_PERIODS = ["MONTH", "ALL"]
 LEADERBOARD_LIMIT = 50           # max per API call
 LEADERBOARD_MAX_PAGES = 6        # 50 * 6 = 300 traders per period
@@ -45,7 +43,6 @@ LEADERBOARD_MAX_PAGES = 6        # 50 * 6 = 300 traders per period
 # ============================================================
 # Scheduling intervals
 # ============================================================
-RANKING_INTERVAL_HOURS = 24      # re-score traders every 24 hours
 POSITION_POLL_MINUTES = 3        # check followed traders every 3 minutes
 ALERT_SUMMARY_HOUR = 20          # daily summary at 8pm
 ALERT_COOLDOWN_MINUTES = 30      # min minutes between alerts for same trader

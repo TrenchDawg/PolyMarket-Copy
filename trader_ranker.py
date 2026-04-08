@@ -18,8 +18,6 @@ from config import (
     MIN_RECENT_WIN_RATE,
     MIN_POSITIONS_VALUE,
     MIN_ROI,
-    MIN_RECENT_POSITIONS,
-    MIN_RECENT_TRADES_PER_DAY,
     LEADERBOARD_CATEGORIES,
     LEADERBOARD_TIME_PERIODS,
     HEALTH_HARD_FILTER,
@@ -460,8 +458,8 @@ def score_all_traders(follow_top_n: int = 10):
     scored_traders = []
     skipped = {
         "pnl": 0, "vol": 0, "no_value": 0, "health": 0,
-        "positions": 0, "recent_positions": 0, "frequency": 0,
-        "win_rate": 0, "roi": 0, "recency": 0, "lb_month": 0, "lb_all": 0,
+        "positions": 0, "win_rate": 0, "roi": 0, "recency": 0,
+        "lb_month": 0, "lb_all": 0,
     }
 
     for i, (wallet, leaderboard_data) in enumerate(discovered.items()):
@@ -501,21 +499,10 @@ def score_all_traders(follow_top_n: int = 10):
             skipped["positions"] += 1
             continue
 
-        # Step 4d: Frequency + recent win rate
+        # Step 4d: Recent win rate
         recent_closed, older_closed = split_by_recency(closed, RECENT_WINDOW_DAYS)
-
-        # Filter #10: Minimum recent closed positions
-        if len(recent_closed) < MIN_RECENT_POSITIONS:
-            skipped["recent_positions"] += 1
-            continue
-
-        # Frequency check: must average at least MIN_RECENT_TRADES_PER_DAY in last 30 days
         trades_per_day = len(recent_closed) / RECENT_WINDOW_DAYS
-        if trades_per_day < MIN_RECENT_TRADES_PER_DAY:
-            skipped["frequency"] += 1
-            continue
 
-        # Recent win rate check (>= 30 positions guaranteed by frequency filter above)
         recent_wr_check = compute_win_rate(recent_closed)
         if recent_wr_check < MIN_RECENT_WIN_RATE:
             skipped["win_rate"] += 1
@@ -609,8 +596,7 @@ def score_all_traders(follow_top_n: int = 10):
     print(
         f"  Skipped: {skipped['pnl']} neg-PnL, {skipped['vol']} low-vol, "
         f"{skipped['no_value']} no-positions, {skipped['health']} bad-health, "
-        f"{skipped['positions']} few-closed, {skipped['recent_positions']} few-recent, "
-        f"{skipped['frequency']} low-freq, "
+        f"{skipped['positions']} few-closed, "
         f"{skipped['win_rate']} low-WR, {skipped['roi']} low-ROI, "
         f"{skipped['recency']} inactive, {skipped['lb_month']} neg-month, "
         f"{skipped['lb_all']} neg-alltime"

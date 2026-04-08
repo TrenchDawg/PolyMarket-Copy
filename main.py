@@ -26,7 +26,6 @@ from db import init_db, get_conn, get_followed_traders
 from trader_ranker import score_all_traders
 from copy_trader import poll_followed_traders, send_alert
 from config import (
-    RANKING_INTERVAL_HOURS,
     POSITION_POLL_MINUTES,
     ALERT_SUMMARY_HOUR,
 )
@@ -133,10 +132,10 @@ def main():
     # Set up scheduler
     scheduler = BlockingScheduler(timezone="UTC")
 
-    # Job 1: Score traders every N hours
+    # Job 1: Score traders every other day at 11pm UTC
     scheduler.add_job(
         run_scoring,
-        trigger=IntervalTrigger(hours=RANKING_INTERVAL_HOURS),
+        trigger=CronTrigger(day='*/2', hour=23, minute=0),
         id="scoring",
         name="Trader Scoring Pipeline",
         next_run_time=datetime.now(timezone.utc),  # run immediately on startup
@@ -162,7 +161,7 @@ def main():
     mode = "DRY RUN" if DRY_RUN else "LIVE"
     print(f"\n{'='*60}")
     print(f"  Polymarket Copy Trader — {mode} MODE")
-    print(f"  Scoring: every {RANKING_INTERVAL_HOURS}h")
+    print(f"  Scoring: every other day at 23:00 UTC")
     print(f"  Polling: every {POSITION_POLL_MINUTES}min")
     print(f"  Summary: daily at {ALERT_SUMMARY_HOUR}:00 UTC")
     print(f"{'='*60}\n")
