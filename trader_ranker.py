@@ -430,7 +430,7 @@ def validate_top_traders(scored_traders: list, n: int = 10):
 # Step 7: Full scoring pipeline
 # ============================================================
 
-def score_all_traders(follow_top_n: int = 10):
+def score_all_traders():
     """
     Main pipeline:
     1. Discover traders from leaderboard
@@ -443,7 +443,7 @@ def score_all_traders(follow_top_n: int = 10):
     7. Compute blended metrics and composite score
     8. Apply health penalty multiplier
     9. Upsert to database
-    10. Update follow list
+    10. Follow every trader that passed all filters (no top-N cutoff)
     11. Print validation report for top 10
     """
     print("=" * 60)
@@ -712,16 +712,20 @@ def score_all_traders(follow_top_n: int = 10):
     finally:
         conn.close()
 
-    # Update follow list — pass scored wallets so stale DB records can't win
+    # Follow every trader that passed all filters — no top-N cutoff.
+    # scored_traders is the authoritative list for this run, so stale DB
+    # records from previous runs automatically get unfollowed.
     scored_wallet_list = [t["wallet"] for t in scored_traders]
-    update_follow_list(follow_top_n, scored_wallet_list)
+    update_follow_list(scored_wallet_list)
+    print(f"[SCORER] Following all {len(scored_wallet_list)} traders that passed filters")
 
     # Compute allocation percentages for followed traders
     compute_allocations()
 
-    # Print leaderboard summary
+    # Print leaderboard summary (display only — not a follow cutoff)
+    preview_n = min(10, len(scored_traders))
     print(f"\n{'='*60}")
-    print(f"[SCORER] Scoring complete — Top {min(10, len(scored_traders))} traders:")
+    print(f"[SCORER] Showing top {preview_n} of {len(scored_traders)} followed traders:")
     print(f"{'='*60}")
     for i, t in enumerate(scored_traders[:10]):
         lb = t["leaderboard"]
@@ -748,11 +752,9 @@ def score_all_traders(follow_top_n: int = 10):
 # ============================================================
 
 if __name__ == "__main__":
-    import sys
     from db import init_db
 
     print("[SCORER] Initializing database...")
     init_db()
 
-    top_n = int(sys.argv[1]) if len(sys.argv) > 1 else 10
-    score_all_traders(follow_top_n=top_n)
+    score_all_traders()

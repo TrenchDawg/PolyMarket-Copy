@@ -40,8 +40,7 @@ def run_scoring():
         print(f"\n{'='*60}")
         print(f"[SCHEDULER] Scoring run at {datetime.now(timezone.utc).isoformat()}")
         print(f"{'='*60}")
-        follow_n = 10  # could read from system_config
-        score_all_traders(follow_top_n=follow_n)
+        score_all_traders()
     except Exception as e:
         print(f"[SCHEDULER] Scoring failed: {e}")
         import traceback
@@ -118,7 +117,7 @@ def main():
 
     # One-shot modes
     if "--score-only" in sys.argv:
-        score_all_traders(follow_top_n=10)
+        score_all_traders()
         return
 
     if "--poll-only" in sys.argv:

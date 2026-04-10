@@ -174,7 +174,6 @@ INSERT INTO system_config (key, value) VALUES
     ('max_position_usd', '50'),          -- max per copy trade
     ('max_daily_trades', '10'),          -- circuit breaker
     ('min_composite_score', '0.6'),      -- only copy traders above this
-    ('follow_top_n', '10'),             -- number of traders to follow
     ('portfolio_fraction', '0.05')       -- 5% of portfolio per copy trade
 ON CONFLICT (key) DO NOTHING;
 

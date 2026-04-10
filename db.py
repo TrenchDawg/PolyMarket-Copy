@@ -108,40 +108,27 @@ def get_top_traders(limit: int = 10) -> list:
         conn.close()
 
 
-def update_follow_list(top_n: int, scored_wallets: list = None):
+def update_follow_list(scored_wallets: list):
     """
-    Set is_followed=TRUE for top N traders, FALSE for rest.
-    scored_wallets: if provided, only consider traders from the current scoring run.
-    This prevents stale high-scoring traders (who were dropped from discovery)
-    from staying followed indefinitely via their old composite_score.
+    Follow every trader that passed all scoring filters in the current run.
+    No top-N cutoff: if a trader survived every filter, they're worth following.
+
+    scored_wallets is the authoritative list from score_all_traders() — any
+    trader not in this list gets unfollowed, which prevents stale high-scoring
+    records (dropped from discovery) from staying followed indefinitely.
     """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
-            # Unfollow all
+            # Unfollow everyone first
             cur.execute("UPDATE traders SET is_followed = FALSE")
-            # Follow top N — restricted to current run's scored wallets if provided
+            # Follow every wallet from the current scoring run
             if scored_wallets:
                 cur.execute("""
                     UPDATE traders SET is_followed = TRUE
-                    WHERE proxy_wallet IN (
-                        SELECT proxy_wallet FROM traders
-                        WHERE composite_score IS NOT NULL
-                          AND proxy_wallet = ANY(%s)
-                        ORDER BY composite_score DESC
-                        LIMIT %s
-                    )
-                """, (scored_wallets, top_n))
-            else:
-                cur.execute("""
-                    UPDATE traders SET is_followed = TRUE
-                    WHERE proxy_wallet IN (
-                        SELECT proxy_wallet FROM traders
-                        WHERE composite_score IS NOT NULL
-                        ORDER BY composite_score DESC
-                        LIMIT %s
-                    )
-                """, (top_n,))
+                    WHERE proxy_wallet = ANY(%s)
+                      AND composite_score IS NOT NULL
+                """, (scored_wallets,))
         conn.commit()
     finally:
         conn.close()
