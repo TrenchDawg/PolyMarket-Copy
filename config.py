@@ -45,6 +45,7 @@ LEADERBOARD_MAX_PAGES = 6        # 50 * 6 = 300 traders per period
 # ============================================================
 POSITION_POLL_MINUTES = 3        # check followed traders every 3 minutes
 ALERT_SUMMARY_HOUR = 20          # daily summary at 8pm
+REALTIME_ALERT_MAX_POSITIONS = 10  # Only send real-time alerts for traders with ≤ 10 open positions
 
 # ============================================================
 # Copy trading parameters

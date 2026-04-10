@@ -27,6 +27,7 @@ from config import (
     POLYMARKET_SIGNATURE_TYPE,
     POLY_PRIVATE_KEY,
     POLY_WALLET_ADDRESS,
+    REALTIME_ALERT_MAX_POSITIONS,
 )
 from db import (
     get_followed_traders,
@@ -124,9 +125,10 @@ def place_exit_order(token_id: str, shares: float, title: str = "") -> Optional[
 def detect_new_positions(wallet: str, username: str = "") -> tuple:
     """
     Compare current positions against followed_positions table.
-    Returns (new_entries, exits) where:
+    Returns (new_entries, exits, api_position_count) where:
       - new_entries: list of positions the trader just entered (not pre-existing)
       - exits: list of positions the trader just exited
+      - api_position_count: total number of open positions in the API response
     """
     from db import (
         get_followed_open_positions,
@@ -138,7 +140,7 @@ def detect_new_positions(wallet: str, username: str = "") -> tuple:
     # Get current positions from API
     current = client.get_positions(wallet, size_threshold=10)
     if current is None:
-        return [], []
+        return [], [], 0
 
     current_assets = {pos.get("asset", ""): pos for pos in current if pos.get("asset")}
 
@@ -167,7 +169,7 @@ def detect_new_positions(wallet: str, username: str = "") -> tuple:
                 "pre_existing": True,
             })
         print(f"[POLL] {username or wallet[:10]}: API={len(current)} positions, DB=0 tracked, baseline saved, new=0, exits=0")
-        return [], []
+        return [], [], len(current)
 
     # Get what we're currently tracking
     tracked = get_followed_open_positions(wallet)
@@ -221,7 +223,7 @@ def detect_new_positions(wallet: str, username: str = "") -> tuple:
             exits.append(tracked_pos)
 
     print(f"[POLL] {username or wallet[:10]}: new={len(new_entries)}, exits={len(exits)}")
-    return new_entries, exits
+    return new_entries, exits, len(current_assets)
 
 
 # ============================================================
@@ -521,7 +523,16 @@ def poll_followed_traders(dry_run: bool = True):
         wallet = trader["proxy_wallet"]
         username = trader.get("username", wallet[:10])
 
-        new_entries, exits = detect_new_positions(wallet, username)
+        new_entries, exits, api_position_count = detect_new_positions(wallet, username)
+
+        # High-volume traders: track changes in DB but suppress real-time alerts.
+        # DB upserts already happened inside detect_new_positions, so changes are
+        # captured for the daily summary regardless of this gate.
+        if api_position_count > REALTIME_ALERT_MAX_POSITIONS:
+            total_changes = len(new_entries) + len(exits)
+            if total_changes > 0:
+                print(f"[POLL] {username}: {total_changes} changes tracked silently (high-volume trader)")
+            continue
 
         if new_entries:
             print(f"[POLL] {username}: {len(new_entries)} new entry(s) detected!")
