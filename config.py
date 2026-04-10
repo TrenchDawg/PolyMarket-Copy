@@ -30,7 +30,7 @@ MAX_DAYS_SINCE_LAST_TRADE = 14   # must have traded recently
 REQUIRE_POSITIVE_PNL = True      # only score profitable traders
 MIN_RECENT_WIN_RATE = 0.90       # 90% win rate in last 30 days
 MIN_POSITIONS_VALUE = 0.01       # must have live positions worth >$0
-MIN_ROI = 0.01                   # 1% minimum blended ROI
+MIN_ROI = 0.025                  # 2.5% minimum blended ROI
 
 # ============================================================
 # Leaderboard scraping parameters
@@ -58,7 +58,7 @@ MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
 # ============================================================
 # Open position health check
 # ============================================================
-HEALTH_HARD_FILTER = -0.50      # exclude traders losing >50% of portfolio on open positions
+HEALTH_HARD_FILTER = -0.20      # exclude traders losing >20% of portfolio on open positions
 HEALTH_PENALTY_FACTOR = 0.5     # how aggressively to penalize (0.5 = moderate)
 
 # ============================================================
