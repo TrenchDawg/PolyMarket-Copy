@@ -249,43 +249,45 @@ class PolymarketClient:
 
     def get_own_balance(self) -> float:
         """
-        Fetch our USDC balance from the Polymarket CLOB.
+        Fetch our USDC collateral balance from the Polymarket CLOB.
 
-        Returns the collateral balance the signing wallet has on Polymarket.
-        On any failure returns 0.0 so callers can fall back to a static value.
-        Import is lazy so the data-only paths don't pull in py_clob_client.
+        Returns balance in USD. The API returns a string in micro-units
+        (6 decimals), e.g. '49973113' = $49.97.
+        On any failure returns 0.0 so callers skip trading that cycle.
         """
-        from config import (
-            POLYMARKET_CLOB_HOST,
-            POLYMARKET_CHAIN_ID,
-            POLYMARKET_SIGNATURE_TYPE,
-            POLY_PRIVATE_KEY,
-            POLY_WALLET_ADDRESS,
-        )
-        if not POLY_PRIVATE_KEY or not POLY_WALLET_ADDRESS:
-            return 0.0
         try:
             from py_clob_client.client import ClobClient
+            from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
+            from config import (
+                POLY_API_KEY,
+                POLY_API_SECRET,
+                POLY_API_PASSPHRASE,
+                POLY_PRIVATE_KEY,
+                POLYMARKET_CLOB_HOST,
+                POLYMARKET_CHAIN_ID,
+                POLYMARKET_SIGNATURE_TYPE,
+            )
+
+            if not POLY_PRIVATE_KEY or not POLY_API_KEY:
+                return 0.0
+
+            creds = ApiCreds(
+                api_key=POLY_API_KEY,
+                api_secret=POLY_API_SECRET,
+                api_passphrase=POLY_API_PASSPHRASE,
+            )
             clob = ClobClient(
                 host=POLYMARKET_CLOB_HOST,
                 key=POLY_PRIVATE_KEY,
                 chain_id=POLYMARKET_CHAIN_ID,
                 signature_type=POLYMARKET_SIGNATURE_TYPE,
-                funder=POLY_WALLET_ADDRESS,
+                creds=creds,
             )
-            clob.set_api_creds(clob.create_or_derive_api_creds())
-            balance = clob.get_balance_allowance()
-            if not balance:
-                return 0.0
-            raw = balance.get("balance", 0)
-            # py_clob_client returns balance as an integer string in 6-decimal USDC units
-            try:
-                as_float = float(raw)
-            except (TypeError, ValueError):
-                return 0.0
-            if as_float > 10_000:  # looks like raw USDC (6 decimals)
-                return as_float / 1_000_000
-            return as_float
+            result = clob.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
+            )
+            raw = int(result.get("balance", 0))
+            return raw / 1_000_000  # Convert micro-units to USD
         except Exception as e:
-            print(f"[BALANCE] Failed to fetch own balance: {type(e).__name__}")
+            print(f"[BALANCE] Failed: {e}")
             return 0.0

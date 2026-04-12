@@ -665,8 +665,8 @@ def score_all_traders():
     update_follow_list(scored_wallet_list)
     print(f"[SCORER] Following all {len(scored_wallet_list)} traders that passed filters")
 
-    # Position sizing is flat (COPY_TRADE_SIZE_USD) — no per-trader allocation
-    # step here. Scoring's only job is to decide WHO we follow.
+    # Position sizing is handled by calculate_trade_size() in copy_trader.py
+    # (U-shaped, balance-relative). Scoring's only job is to decide WHO we follow.
 
     # Print leaderboard summary (display only — not a follow cutoff)
     preview_n = min(10, len(scored_traders))

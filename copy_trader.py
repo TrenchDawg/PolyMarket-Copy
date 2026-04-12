@@ -18,16 +18,22 @@ from polymarket_client import PolymarketClient
 from config import (
     MAX_DAILY_TRADES,
     MAX_SPREAD_PCT,
+    MAX_TRADE_SIZE_USD,
     ALERT_WEBHOOK_URL,
-    COPY_TRADE_SIZE_USD,
-    FALLBACK_BALANCE_USD,
     PARTIAL_SIZE_CHANGE_THRESHOLD,
+    TRADE_SIZE_FLOOR_PCT,
+    TRADE_SIZE_CEILING_PCT,
+    TRADE_SIZE_MIDPOINT,
+    TRADE_SIZE_MAX_DISTANCE,
     TICK_SIZE,
     LOT_SIZE,
     MIN_ORDER_SIZE,
     POLYMARKET_CLOB_HOST,
     POLYMARKET_CHAIN_ID,
     POLYMARKET_SIGNATURE_TYPE,
+    POLY_API_KEY,
+    POLY_API_SECRET,
+    POLY_API_PASSPHRASE,
     POLY_PRIVATE_KEY,
     POLY_WALLET_ADDRESS,
     REALTIME_ALERT_MAX_POSITIONS,
@@ -74,6 +80,33 @@ def round_to_tick(value: float, tick: float = LOT_SIZE) -> float:
     if value <= 0:
         return 0.0
     return round(math.floor(value / tick) * tick, 8)
+
+
+def calculate_trade_size(account_balance: float, entry_price: float) -> float:
+    """
+    U-shaped sizing: high probability (90¢+) and high EV (60-70¢) get more capital.
+    Dead zone around 80¢ gets minimum allocation.
+    Floor and ceiling scale with account balance.
+    """
+    if entry_price <= 0 or entry_price >= 1 or account_balance <= 0:
+        return 0.0
+
+    floor = account_balance * TRADE_SIZE_FLOOR_PCT
+    ceiling = account_balance * TRADE_SIZE_CEILING_PCT
+
+    distance = abs(entry_price - TRADE_SIZE_MIDPOINT)
+    size_range = ceiling - floor
+
+    size = floor + (distance * size_range / TRADE_SIZE_MAX_DISTANCE)
+    size = min(size, ceiling)
+    size = min(size, MAX_TRADE_SIZE_USD)  # Absolute hard cap
+    size = max(size, floor)
+    size = round_to_tick(size, LOT_SIZE)
+
+    if size < MIN_ORDER_SIZE:
+        return 0.0
+
+    return size
 
 
 def make_idempotency_key(source_wallet: str, asset_id: str) -> str:
@@ -166,6 +199,7 @@ _clob_client = None
 def get_clob_client():
     """Get an authenticated CLOB client. Initializes on first call."""
     from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds
     global _clob_client
     if _clob_client is not None:
         return _clob_client
@@ -174,15 +208,24 @@ def get_clob_client():
         print("[CLOB] No private key or wallet address configured. Cannot place orders.")
         return None
 
+    if not POLY_API_KEY or not POLY_API_SECRET or not POLY_API_PASSPHRASE:
+        print("[CLOB] No API credentials configured. Cannot place orders.")
+        return None
+
     try:
+        creds = ApiCreds(
+            api_key=POLY_API_KEY,
+            api_secret=POLY_API_SECRET,
+            api_passphrase=POLY_API_PASSPHRASE,
+        )
         clob = ClobClient(
             host=POLYMARKET_CLOB_HOST,
             key=POLY_PRIVATE_KEY,
             chain_id=POLYMARKET_CHAIN_ID,
             signature_type=POLYMARKET_SIGNATURE_TYPE,
             funder=POLY_WALLET_ADDRESS,
+            creds=creds,
         )
-        clob.set_api_creds(clob.create_or_derive_api_creds())
         print("[CLOB] Authenticated successfully")
         _clob_client = clob
         return clob
@@ -565,18 +608,13 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
     # every single order to minimize the window where a panic-toggle is ignored.
     live_trading = is_trading_enabled() and not dry_run
 
-    # Flat-size model: we no longer size positions as a % of account, so the
-    # per-cycle balance fetch is informational only. Still log it when live so
-    # the operator can spot a drained wallet before the next trade.
-    if live_trading:
-        account_balance = client.get_own_balance()
-        if account_balance <= 0:
-            print(f"[POLL] Dynamic balance fetch returned 0 (fallback ${FALLBACK_BALANCE_USD})")
-            account_balance = FALLBACK_BALANCE_USD
-        else:
-            print(f"[POLL] Account balance: ${account_balance:.2f}")
-        if account_balance < COPY_TRADE_SIZE_USD:
-            print(f"[POLL] WARNING: balance ${account_balance:.2f} < COPY_TRADE_SIZE_USD ${COPY_TRADE_SIZE_USD}")
+    # Fetch account balance for U-shaped sizing. If the fetch fails,
+    # balance stays 0 and no trades will be sized this cycle.
+    account_balance = client.get_own_balance()
+    if account_balance > 0:
+        print(f"[POLL] Account balance: ${account_balance:.2f}")
+    else:
+        print(f"[POLL] Balance fetch returned $0 — no trades will be sized this cycle")
 
     # Snapshot the daily trade count at the start of the cycle; increment
     # locally as we place orders. We also re-check the DB value on every loop
@@ -630,15 +668,20 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
             for pos in new_entries:
                 title = pos.get("title", "unknown")
                 outcome = pos.get("outcome", "?")
-                price = float(pos.get("curPrice", 0) or 0)
                 token_id = pos.get("asset", "")
 
-                # Flat-size model: same dollar amount per copy trade, rounded
-                # down to the lot size. Anything below the CLOB minimum is
-                # skipped so we don't send a rejected order.
-                size_usd = round_to_tick(COPY_TRADE_SIZE_USD, LOT_SIZE)
-                if size_usd < MIN_ORDER_SIZE:
-                    size_usd = 0.0
+                try:
+                    entry_price = float(pos.get("curPrice") or 0.50)
+                except (ValueError, TypeError):
+                    entry_price = 0.50
+
+                size_usd = calculate_trade_size(account_balance, entry_price)
+
+                if size_usd <= 0:
+                    print(f"[POLL] Trade size too small, skipping '{title}'")
+                    continue
+
+                print(f"[POLL] U-size: ${size_usd:.2f} (balance=${account_balance:.0f}, price={entry_price:.2f})")
 
                 status = "ALERT ONLY"
                 order_result = None
@@ -674,7 +717,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                 title=title,
                             )
                             if is_order_filled(order_result):
-                                shares = size_usd / price if price > 0 else 0
+                                shares = size_usd / entry_price if entry_price > 0 else 0
                                 try:
                                     log_copy_trade({
                                         "source_wallet": wallet,
@@ -685,7 +728,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                         "market_slug": pos.get("slug", ""),
                                         "outcome": outcome,
                                         "side": "BUY",
-                                        "entry_price": price,
+                                        "entry_price": entry_price,
                                         "size_usd": size_usd,
                                         "shares": shares,
                                         "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
@@ -717,12 +760,12 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                 status = "NOT FILLED"
 
                 entry_lines.append(
-                    f"  - {outcome} @ {price} — {title} [Size: ${size_usd:.2f}] [{status}]"
+                    f"  - {outcome} @ {entry_price} — {title} [Size: ${size_usd:.2f}] [{status}]"
                 )
 
             send_alert("BATCH_ENTRY", {
                 "source_username": username,
-                "count": len(new_entries),
+                "count": len(entry_lines),
                 "entries": "\n".join(entry_lines),
                 "live_trading": live_trading,
             })

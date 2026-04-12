@@ -52,8 +52,7 @@ REALTIME_ALERT_MAX_POSITIONS = 50  # Only send real-time alerts for traders with
 # ============================================================
 # Copy trading parameters
 # ============================================================
-DEFAULT_PORTFOLIO_FRACTION = 0.05   # 5% of portfolio per copy trade
-MAX_POSITION_USD = 50.0             # hard cap per trade
+MAX_TRADE_SIZE_USD = 50.0            # Hard cap regardless of account size
 MAX_DAILY_TRADES = 10               # circuit breaker
 MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
 PARTIAL_SIZE_CHANGE_THRESHOLD = 0.20  # Alert if trader resizes a position by more than 20%
@@ -98,13 +97,15 @@ DATABASE_URL = os.getenv(
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
 
 # ============================================================
-# Position sizing (flat per-trade)
+# Position sizing (U-shaped, balance-relative)
 # ============================================================
-# With many followed traders, per-trader percentage allocation was producing
-# sizes below the CLOB minimum. We now spend a flat dollar amount per copy
-# trade regardless of trader or market.
-COPY_TRADE_SIZE_USD = 5.0        # flat USD size per copy trade
-FALLBACK_BALANCE_USD = 277.0     # used if dynamic balance fetch fails
+# High-probability (90¢+) and high-EV (60-70¢) prices get more capital;
+# dead zone around 80¢ gets minimum allocation. Floor and ceiling scale
+# with account balance so sizing stays proportional as the account grows.
+TRADE_SIZE_FLOOR_PCT = 0.01      # 1% of account = minimum trade
+TRADE_SIZE_CEILING_PCT = 0.05    # 5% of account = maximum trade
+TRADE_SIZE_MIDPOINT = 0.80       # Dead zone center — lowest allocation
+TRADE_SIZE_MAX_DISTANCE = 0.20   # Max distance from midpoint for normalization
 
 # ============================================================
 # Polymarket CLOB (order execution)
@@ -116,8 +117,8 @@ POLYMARKET_SIGNATURE_TYPE = 1       # 1 = Magic/email wallet
 # ============================================================
 # Polymarket authentication (for order placement)
 # ============================================================
-POLYMARKET_API_KEY = os.getenv("POLYMARKET_API_KEY", "")
-POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
-POLYMARKET_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
+POLY_API_KEY = os.getenv("POLY_API_KEY", "")
+POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
+POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 POLY_WALLET_ADDRESS = os.getenv("POLY_WALLET_ADDRESS", "")
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
