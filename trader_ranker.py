@@ -28,7 +28,7 @@ from config import (
     EFFICIENCY_BONUS_MAX,
     EFFICIENCY_WR_BASELINE,
 )
-from db import update_follow_list, get_conn, get_followed_traders
+from db import update_follow_list, get_conn, release_conn
 
 
 client = PolymarketClient()
@@ -58,60 +58,6 @@ def discover_traders() -> dict:
                     traders[wallet] = t
             print(f"  → {len(batch)} traders, {len(traders)} unique total")
     return traders
-
-
-# ============================================================
-# Allocation: compute portfolio % per followed trader
-# ============================================================
-
-def compute_allocations():
-    """
-    Compute portfolio allocation percentages for followed traders.
-    Based on normalized Sharpe + ROI scores.
-    """
-    from config import ALLOCATION_SHARPE_WEIGHT, ALLOCATION_ROI_WEIGHT
-
-    followed = get_followed_traders()
-    if not followed:
-        return
-
-    # Compute raw allocation score for each trader
-    allocation_scores = []
-    for t in followed:
-        sharpe = float(t.get("consistency_score", 0) or 0)
-        roi = float(t.get("roi_pct", 0) or 0)
-
-        raw_score = (ALLOCATION_SHARPE_WEIGHT * sharpe) + (ALLOCATION_ROI_WEIGHT * roi)
-        raw_score = max(raw_score, 0.01)  # floor to prevent zero allocation
-        allocation_scores.append((t["proxy_wallet"], raw_score))
-
-    # Normalize to percentages (sum to 1.0)
-    total_score = sum(score for _, score in allocation_scores)
-
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            for wallet, score in allocation_scores:
-                allocation_pct = score / total_score if total_score > 0 else 1.0 / len(allocation_scores)
-                cur.execute("""
-                    UPDATE traders SET allocation_pct = %s WHERE proxy_wallet = %s
-                """, (round(allocation_pct, 4), wallet))
-        conn.commit()
-    finally:
-        conn.close()
-
-    # Print allocation summary
-    print(f"\n[ALLOCATION] Portfolio allocation:")
-    for wallet, score in sorted(allocation_scores, key=lambda x: x[1], reverse=True):
-        pct = score / total_score * 100 if total_score > 0 else 100 / len(allocation_scores)
-        name = wallet[:10]
-        for t in followed:
-            if t["proxy_wallet"] == wallet:
-                name = t.get("username", wallet[:10])
-                break
-        sharpe = next((float(t.get("consistency_score", 0) or 0) for t in followed if t["proxy_wallet"] == wallet), 0)
-        roi = next((float(t.get("roi_pct", 0) or 0) for t in followed if t["proxy_wallet"] == wallet), 0)
-        print(f"  {name:<20} {pct:.1f}%  (sharpe={sharpe:.2f}, roi={roi:.1%})")
 
 
 # ============================================================
@@ -710,7 +656,7 @@ def score_all_traders():
         conn.commit()
         print(f"[SCORER] All {len(scored_traders)} traders written to database")
     finally:
-        conn.close()
+        release_conn(conn)
 
     # Follow every trader that passed all filters — no top-N cutoff.
     # scored_traders is the authoritative list for this run, so stale DB
@@ -719,8 +665,8 @@ def score_all_traders():
     update_follow_list(scored_wallet_list)
     print(f"[SCORER] Following all {len(scored_wallet_list)} traders that passed filters")
 
-    # Compute allocation percentages for followed traders
-    compute_allocations()
+    # Position sizing is flat (COPY_TRADE_SIZE_USD) — no per-trader allocation
+    # step here. Scoring's only job is to decide WHO we follow.
 
     # Print leaderboard summary (display only — not a follow cutoff)
     preview_n = min(10, len(scored_traders))

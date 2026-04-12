@@ -43,7 +43,9 @@ LEADERBOARD_MAX_PAGES = 6        # 50 * 6 = 300 traders per period
 # ============================================================
 # Scheduling intervals
 # ============================================================
-POSITION_POLL_MINUTES = 3        # check followed traders every 3 minutes
+POSITION_POLL_SECONDS = 120      # normal poll: check all followed traders every 2 minutes
+ACTIVE_TRADER_POLL_SECONDS = 30  # poll every 30s for traders with recent activity
+ACTIVE_TRADER_WINDOW_MINUTES = 10  # how long a trader stays in "active" mode after a detected entry or exit
 ALERT_SUMMARY_HOUR = 20          # daily summary at 8pm
 REALTIME_ALERT_MAX_POSITIONS = 10  # Only send real-time alerts for traders with ≤ 10 open positions
 
@@ -53,8 +55,15 @@ REALTIME_ALERT_MAX_POSITIONS = 10  # Only send real-time alerts for traders with
 DEFAULT_PORTFOLIO_FRACTION = 0.05   # 5% of portfolio per copy trade
 MAX_POSITION_USD = 50.0             # hard cap per trade
 MAX_DAILY_TRADES = 10               # circuit breaker
-MIN_LIQUIDITY_USD = 5000            # skip illiquid markets
 MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
+PARTIAL_SIZE_CHANGE_THRESHOLD = 0.20  # Alert if trader resizes a position by more than 20%
+
+# ============================================================
+# Order rounding (Polymarket CLOB increments)
+# ============================================================
+TICK_SIZE = 0.01        # minimum price increment (1 cent)
+LOT_SIZE = 0.01         # minimum order size increment
+MIN_ORDER_SIZE = 1.00   # minimum order notional in USD
 
 # ============================================================
 # Open position health check
@@ -89,13 +98,13 @@ DATABASE_URL = os.getenv(
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
 
 # ============================================================
-# Position allocation
+# Position sizing (flat per-trade)
 # ============================================================
-MAX_POSITION_PCT = 0.15          # max 15% of account on any single trade
-MIN_POSITION_CONTRACTS = 1       # minimum 1 contract per trade
-ALLOCATION_SHARPE_WEIGHT = 0.5   # 50% weight to consistency in allocation calc
-ALLOCATION_ROI_WEIGHT = 0.5      # 50% weight to ROI in allocation calc
-ACCOUNT_BALANCE_USD = 1000.0     # starting account balance (will be dynamic later)
+# With many followed traders, per-trader percentage allocation was producing
+# sizes below the CLOB minimum. We now spend a flat dollar amount per copy
+# trade regardless of trader or market.
+COPY_TRADE_SIZE_USD = 5.0        # flat USD size per copy trade
+FALLBACK_BALANCE_USD = 277.0     # used if dynamic balance fetch fails
 
 # ============================================================
 # Polymarket CLOB (order execution)

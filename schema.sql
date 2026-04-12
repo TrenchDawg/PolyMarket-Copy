@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS copy_trades (
     size_usd            NUMERIC(18,2),
     shares              NUMERIC(18,6),
     order_id            TEXT,                      -- Polymarket order ID
+    idempotency_key     TEXT,                      -- uniqueness enforced by a PARTIAL index (OPEN only) so re-entry after exit is allowed
 
     -- Result tracking
     exit_price          NUMERIC(10,6),
@@ -94,6 +95,33 @@ CREATE TABLE IF NOT EXISTS copy_trades (
 
 CREATE INDEX IF NOT EXISTS idx_copy_trades_status ON copy_trades(status);
 CREATE INDEX IF NOT EXISTS idx_copy_trades_source ON copy_trades(source_wallet);
+
+-- Idempotency: only OPEN copy_trades must have a unique key. Once a trade is
+-- CLOSED the same (source, token) can be re-entered without conflict.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_trades_idem_open
+    ON copy_trades(idempotency_key)
+    WHERE status = 'OPEN' AND idempotency_key IS NOT NULL;
+
+-- Migration step 1: add the idempotency_key column on existing tables
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'copy_trades' AND column_name = 'idempotency_key') THEN
+        ALTER TABLE copy_trades ADD COLUMN idempotency_key TEXT;
+    END IF;
+END $$;
+
+-- Migration step 2: drop any legacy full-table UNIQUE constraint left over
+-- from the previous iteration of this schema (it would block re-entry).
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM information_schema.table_constraints
+               WHERE table_name = 'copy_trades'
+                 AND constraint_name = 'copy_trades_idempotency_key_key'
+                 AND constraint_type = 'UNIQUE') THEN
+        ALTER TABLE copy_trades DROP CONSTRAINT copy_trades_idempotency_key_key;
+    END IF;
+END $$;
 
 DO $$
 BEGIN
@@ -136,6 +164,7 @@ CREATE TABLE IF NOT EXISTS followed_positions (
 
     -- Entry data
     size            NUMERIC(18,6),
+    size_at_last_poll NUMERIC(18,6) DEFAULT 0,   -- size we saw in the previous poll (for partial-change detection)
     avg_price       NUMERIC(10,6),
     entry_price     NUMERIC(10,6),        -- price when we first detected it
 
@@ -158,6 +187,15 @@ CREATE TABLE IF NOT EXISTS followed_positions (
 CREATE INDEX IF NOT EXISTS idx_followed_positions_wallet ON followed_positions(proxy_wallet);
 CREATE INDEX IF NOT EXISTS idx_followed_positions_status ON followed_positions(status);
 CREATE INDEX IF NOT EXISTS idx_followed_positions_open ON followed_positions(proxy_wallet, status) WHERE status = 'OPEN';
+
+-- Migration: add size_at_last_poll to existing followed_positions tables
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'followed_positions' AND column_name = 'size_at_last_poll') THEN
+        ALTER TABLE followed_positions ADD COLUMN size_at_last_poll NUMERIC(18,6) DEFAULT 0;
+    END IF;
+END $$;
 
 -- ============================================================
 -- SYSTEM_CONFIG: Runtime configuration (kill switch, etc.)

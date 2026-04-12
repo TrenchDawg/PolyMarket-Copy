@@ -96,8 +96,15 @@ class PolymarketClient:
     # Trader profile & positions
     # ============================================================
 
-    def get_positions(self, wallet: str, size_threshold: float = 10) -> list:
-        """Get current open positions for a wallet."""
+    def get_positions(self, wallet: str, size_threshold: float = 0) -> list:
+        """
+        Get current open positions for a wallet.
+
+        `size_threshold` defaults to 0 so the polling path sees ALL positions
+        regardless of size — otherwise dust-sized positions disappear from the
+        API response and we'd trigger false exit alerts. The scorer passes a
+        higher threshold explicitly to skip dust during ranking.
+        """
         data = self._get(
             f"{POLYMARKET_DATA_API}/positions",
             params={
@@ -235,3 +242,50 @@ class PolymarketClient:
             params={"conditionId": condition_id}
         )
         return data if isinstance(data, list) else []
+
+    # ============================================================
+    # Own wallet balance (for dynamic position sizing)
+    # ============================================================
+
+    def get_own_balance(self) -> float:
+        """
+        Fetch our USDC balance from the Polymarket CLOB.
+
+        Returns the collateral balance the signing wallet has on Polymarket.
+        On any failure returns 0.0 so callers can fall back to a static value.
+        Import is lazy so the data-only paths don't pull in py_clob_client.
+        """
+        from config import (
+            POLYMARKET_CLOB_HOST,
+            POLYMARKET_CHAIN_ID,
+            POLYMARKET_SIGNATURE_TYPE,
+            POLY_PRIVATE_KEY,
+            POLY_WALLET_ADDRESS,
+        )
+        if not POLY_PRIVATE_KEY or not POLY_WALLET_ADDRESS:
+            return 0.0
+        try:
+            from py_clob_client.client import ClobClient
+            clob = ClobClient(
+                host=POLYMARKET_CLOB_HOST,
+                key=POLY_PRIVATE_KEY,
+                chain_id=POLYMARKET_CHAIN_ID,
+                signature_type=POLYMARKET_SIGNATURE_TYPE,
+                funder=POLY_WALLET_ADDRESS,
+            )
+            clob.set_api_creds(clob.create_or_derive_api_creds())
+            balance = clob.get_balance_allowance()
+            if not balance:
+                return 0.0
+            raw = balance.get("balance", 0)
+            # py_clob_client returns balance as an integer string in 6-decimal USDC units
+            try:
+                as_float = float(raw)
+            except (TypeError, ValueError):
+                return 0.0
+            if as_float > 10_000:  # looks like raw USDC (6 decimals)
+                return as_float / 1_000_000
+            return as_float
+        except Exception as e:
+            print(f"[BALANCE] Failed to fetch own balance: {type(e).__name__}")
+            return 0.0
