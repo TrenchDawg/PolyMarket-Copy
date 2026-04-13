@@ -141,6 +141,39 @@ def graceful_shutdown(signum, frame):
 def main():
     global DRY_RUN
 
+    # Test order via Madrid proxy (no DB needed)
+    if "--test-order" in sys.argv:
+        import requests
+        from config import ORDER_PROXY_URL, ORDER_PROXY_AUTH_TOKEN
+
+        headers = {"Authorization": f"Bearer {ORDER_PROXY_AUTH_TOKEN}"}
+
+        # Check geoblock
+        geo = requests.get(f"{ORDER_PROXY_URL}/geocheck").json()
+        print(f"Geocheck: {geo}")
+
+        # Check balance
+        bal = requests.get(f"{ORDER_PROXY_URL}/balance", headers=headers).json()
+        print(f"Balance: {bal}")
+
+        # Get price for test token
+        TEST_TOKEN = "42226471287631305147124009130697472279390700811292616532685434752232432877995"
+        price_data = requests.get(f"{ORDER_PROXY_URL}/price", params={"token_id": TEST_TOKEN, "side": "buy"}, headers=headers).json()
+        print(f"Price: {price_data}")
+        p = float(price_data.get("price", 0))
+
+        if p > 0:
+            # Place $1 test order
+            result = requests.post(f"{ORDER_PROXY_URL}/execute-order", json={
+                "token_id": TEST_TOKEN,
+                "side": "BUY",
+                "size": round(1.0 / p, 2),
+                "price": p,
+            }, headers=headers).json()
+            print(f"Order result: {result}")
+
+        sys.exit(0)
+
     # Parse args
     if "--live" in sys.argv:
         DRY_RUN = False

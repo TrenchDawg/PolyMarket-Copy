@@ -248,46 +248,16 @@ class PolymarketClient:
     # ============================================================
 
     def get_own_balance(self) -> float:
-        """
-        Fetch our USDC collateral balance from the Polymarket CLOB.
-
-        Returns balance in USD. The API returns a string in micro-units
-        (6 decimals), e.g. '49973113' = $49.97.
-        On any failure returns 0.0 so callers skip trading that cycle.
-        """
+        import requests
+        from config import ORDER_PROXY_URL, ORDER_PROXY_AUTH_TOKEN
         try:
-            from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import ApiCreds, BalanceAllowanceParams, AssetType
-            from config import (
-                POLY_API_KEY,
-                POLY_API_SECRET,
-                POLY_API_PASSPHRASE,
-                POLY_PRIVATE_KEY,
-                POLYMARKET_CLOB_HOST,
-                POLYMARKET_CHAIN_ID,
-                POLYMARKET_SIGNATURE_TYPE,
+            resp = requests.get(
+                f"{ORDER_PROXY_URL}/balance",
+                headers={"Authorization": f"Bearer {ORDER_PROXY_AUTH_TOKEN}"},
+                timeout=15,
             )
-
-            if not POLY_PRIVATE_KEY or not POLY_API_KEY:
-                return 0.0
-
-            creds = ApiCreds(
-                api_key=POLY_API_KEY,
-                api_secret=POLY_API_SECRET,
-                api_passphrase=POLY_API_PASSPHRASE,
-            )
-            clob = ClobClient(
-                host=POLYMARKET_CLOB_HOST,
-                key=POLY_PRIVATE_KEY,
-                chain_id=POLYMARKET_CHAIN_ID,
-                signature_type=POLYMARKET_SIGNATURE_TYPE,
-                creds=creds,
-            )
-            result = clob.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
-            )
-            raw = int(result.get("balance", 0))
-            return raw / 1_000_000  # Convert micro-units to USD
+            data = resp.json()
+            return float(data.get("balance_usd", 0))
         except Exception as e:
-            print(f"[BALANCE] Failed: {e}")
+            print(f"[BALANCE] Proxy request failed: {e}")
             return 0.0

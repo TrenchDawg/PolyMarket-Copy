@@ -123,3 +123,9 @@ POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
 POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
 POLY_WALLET_ADDRESS = os.getenv("POLY_WALLET_ADDRESS", "")
 POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
+
+# ============================================================
+# Order Proxy (Madrid — routes CLOB calls through non-US VPS)
+# ============================================================
+ORDER_PROXY_URL = os.getenv("ORDER_PROXY_URL", "")
+ORDER_PROXY_AUTH_TOKEN = os.getenv("ORDER_PROXY_AUTH_TOKEN", "")

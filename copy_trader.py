@@ -14,8 +14,6 @@ from typing import Optional
 import psycopg2
 
 from polymarket_client import PolymarketClient
-# py_clob_client imports are lazy-loaded inside get_clob_client() and place_copy_order()
-# to prevent startup crashes if the package has import issues.
 from config import (
     MAX_DAILY_TRADES,
     MAX_SPREAD_PCT,
@@ -29,14 +27,6 @@ from config import (
     TICK_SIZE,
     LOT_SIZE,
     MIN_ORDER_SIZE,
-    POLYMARKET_CLOB_HOST,
-    POLYMARKET_CHAIN_ID,
-    POLYMARKET_SIGNATURE_TYPE,
-    POLY_API_KEY,
-    POLY_API_SECRET,
-    POLY_API_PASSPHRASE,
-    POLY_PRIVATE_KEY,
-    POLY_WALLET_ADDRESS,
     REALTIME_ALERT_MAX_POSITIONS,
     ACTIVE_TRADER_WINDOW_MINUTES,
 )
@@ -273,101 +263,53 @@ def prune_stale_active_traders(window_minutes: int):
 
 
 # ============================================================
-# CLOB client (order execution)
+# Order execution (via Madrid proxy)
 # ============================================================
 
-_clob_client = None
-
-
-def get_clob_client():
-    """Get an authenticated CLOB client. Initializes on first call."""
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import ApiCreds
-    global _clob_client
-    if _clob_client is not None:
-        return _clob_client
-
-    if not POLY_PRIVATE_KEY or not POLY_WALLET_ADDRESS:
-        print("[CLOB] No private key or wallet address configured. Cannot place orders.")
-        return None
-
-    if not POLY_API_KEY or not POLY_API_SECRET or not POLY_API_PASSPHRASE:
-        print("[CLOB] No API credentials configured. Cannot place orders.")
-        return None
+def place_copy_order(token_id: str, side: str, size: float, price: float) -> dict:
+    """Place an order via the Madrid order proxy."""
+    import requests
+    from config import ORDER_PROXY_URL, ORDER_PROXY_AUTH_TOKEN
 
     try:
-        creds = ApiCreds(
-            api_key=POLY_API_KEY,
-            api_secret=POLY_API_SECRET,
-            api_passphrase=POLY_API_PASSPHRASE,
+        resp = requests.post(
+            f"{ORDER_PROXY_URL}/execute-order",
+            json={"token_id": token_id, "side": side, "size": size, "price": price},
+            headers={"Authorization": f"Bearer {ORDER_PROXY_AUTH_TOKEN}"},
+            timeout=30,
         )
-        clob = ClobClient(
-            host=POLYMARKET_CLOB_HOST,
-            key=POLY_PRIVATE_KEY,
-            chain_id=POLYMARKET_CHAIN_ID,
-            signature_type=POLYMARKET_SIGNATURE_TYPE,
-            funder=POLY_WALLET_ADDRESS,
-            creds=creds,
-        )
-        print("[CLOB] Authenticated successfully")
-        _clob_client = clob
-        return clob
+        data = resp.json()
+        if data.get("success"):
+            return data.get("order_result", {})
+        else:
+            print(f"[ORDER] Proxy error: {data.get('error')}")
+            return None
     except Exception as e:
-        print(f"[CLOB] Authentication failed: {type(e).__name__}")
+        print(f"[ORDER] Proxy request failed: {e}")
         return None
 
 
-def place_copy_order(
-    token_id: str,
-    side: str,
-    amount: float,
-    title: str = "",
-) -> Optional[dict]:
-    """
-    Place a FOK market order on Polymarket.
+def place_exit_order(token_id: str, shares: float, price: float, title: str = "") -> Optional[dict]:
+    """Sell/exit a position by selling all shares via proxy."""
+    return place_copy_order(token_id=token_id, side="SELL", size=shares, price=price)
 
-    For BUY orders, `amount` is USDC to spend.
-    For SELL orders, `amount` is shares (contracts) to sell.
-    Returns the raw order response dict (success OR failure). Callers must
-    validate the response via `is_order_filled()` before treating it as a
-    real execution.
 
-    The amount is always rounded DOWN to LOT_SIZE before being sent so the
-    CLOB API doesn't reject us for off-tick size.
-    """
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
-    clob = get_clob_client()
-    if clob is None:
-        print(f"[ORDER] Cannot place order — CLOB client not initialized")
-        return None
-
-    rounded_amount = round_to_tick(amount, LOT_SIZE)
-    unit = "USDC" if side == "BUY" else "shares"
-
-    if rounded_amount <= 0:
-        print(f"[ORDER] Rounded amount is {rounded_amount} {unit}, skipping '{title}'")
-        return None
-
+def get_order_price(token_id: str, side: str = "buy") -> float:
+    """Fetch the current price for a token from the Madrid proxy."""
+    import requests
+    from config import ORDER_PROXY_URL, ORDER_PROXY_AUTH_TOKEN
     try:
-        order_side = BUY if side == "BUY" else SELL
-        mo = MarketOrderArgs(
-            token_id=token_id,
-            amount=rounded_amount,
-            side=order_side,
+        resp = requests.get(
+            f"{ORDER_PROXY_URL}/price",
+            params={"token_id": token_id, "side": side},
+            headers={"Authorization": f"Bearer {ORDER_PROXY_AUTH_TOKEN}"},
+            timeout=15,
         )
-        signed_order = clob.create_market_order(mo)
-        resp = clob.post_order(signed_order, OrderType.FOK)
-        print(f"[ORDER] {side} {rounded_amount:.4f} {unit} on '{title}' — Response: {resp}")
-        return resp
+        data = resp.json()
+        return float(data.get("price", 0))
     except Exception as e:
-        print(f"[ORDER] Failed to place {side} {rounded_amount:.4f} {unit} on '{title}': {type(e).__name__}")
-        return None
-
-
-def place_exit_order(token_id: str, shares: float, title: str = "") -> Optional[dict]:
-    """Sell/exit a position by selling all shares."""
-    return place_copy_order(token_id=token_id, side="SELL", amount=shares, title=title)
+        print(f"[PRICE] Proxy request failed: {e}")
+        return 0.0
 
 
 # ============================================================
@@ -769,59 +711,65 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                             print(f"[POLL-ACTIVE] {username}: spread too wide ({spread_pct:.1%}) on '{title}', skipping")
                             status = f"SKIP (spread {spread_pct:.1%})"
                         else:
-                            print(f"[POLL-ACTIVE] U-size: ${size_usd:.2f} (balance=${account_balance:.0f}, price={entry_price:.2f})")
-                            order_result = place_copy_order(
-                                token_id=token_id,
-                                side="BUY",
-                                amount=size_usd,
-                                title=title,
-                            )
-                            if is_order_filled(order_result):
-                                # Extract real fill data (C1 fix)
-                                actual_shares = extract_fill_shares(order_result)
-                                actual_price = extract_fill_price(order_result)
-                                if actual_shares <= 0:
-                                    print(f"[ORDER] WARNING: Using estimated shares (extraction failed)")
-                                    actual_shares = size_usd / entry_price if entry_price > 0 else 0
-                                if actual_price <= 0:
-                                    actual_price = entry_price
-
-                                try:
-                                    log_copy_trade({
-                                        "source_wallet": wallet,
-                                        "source_username": username,
-                                        "condition_id": pos.get("conditionId", ""),
-                                        "token_id": token_id,
-                                        "market_title": title,
-                                        "market_slug": pos.get("slug", ""),
-                                        "outcome": outcome,
-                                        "side": "BUY",
-                                        "entry_price": actual_price,
-                                        "size_usd": size_usd,
-                                        "shares": actual_shares,
-                                        "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
-                                        "idempotency_key": idem_key,
-                                    })
-                                    daily_trades += 1
-                                    account_balance -= size_usd  # Running balance (H2 fix)
-                                    status = "EXECUTED"
-                                except psycopg2.errors.UniqueViolation:
-                                    print(
-                                        f"[POLL-ACTIVE] {username}: DUPLICATE ORDER WARNING - "
-                                        f"UniqueViolation on idem_key {idem_key}. "
-                                        f"Order placed on-chain but another poll beat us. "
-                                        f"Manual reconciliation required for '{title}'."
-                                    )
-                                    send_alert("DUPLICATE_ORDER", {
-                                        "source_username": username,
-                                        "title": title,
-                                        "idempotency_key": idem_key,
-                                        "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
-                                    })
-                                    status = "DUPLICATE"
+                            order_price = get_order_price(token_id, side="buy")
+                            if order_price <= 0:
+                                print(f"[POLL-ACTIVE] {username}: could not fetch price for '{title}', skipping")
+                                status = "NO PRICE"
                             else:
-                                print(f"[POLL-ACTIVE] {username}: order not filled on '{title}' (FOK killed)")
-                                status = "NOT FILLED"
+                                buy_size = round_to_tick(size_usd / order_price, LOT_SIZE)
+                                print(f"[POLL-ACTIVE] U-size: ${size_usd:.2f} (balance=${account_balance:.0f}, price={order_price:.2f}, shares={buy_size:.2f})")
+                                order_result = place_copy_order(
+                                    token_id=token_id,
+                                    side="BUY",
+                                    size=buy_size,
+                                    price=order_price,
+                                )
+                                if is_order_filled(order_result):
+                                    # Extract real fill data (C1 fix)
+                                    actual_shares = extract_fill_shares(order_result)
+                                    actual_price = extract_fill_price(order_result)
+                                    if actual_shares <= 0:
+                                        print(f"[ORDER] WARNING: Using estimated shares (extraction failed)")
+                                        actual_shares = size_usd / order_price if order_price > 0 else 0
+                                    if actual_price <= 0:
+                                        actual_price = order_price
+
+                                    try:
+                                        log_copy_trade({
+                                            "source_wallet": wallet,
+                                            "source_username": username,
+                                            "condition_id": pos.get("conditionId", ""),
+                                            "token_id": token_id,
+                                            "market_title": title,
+                                            "market_slug": pos.get("slug", ""),
+                                            "outcome": outcome,
+                                            "side": "BUY",
+                                            "entry_price": actual_price,
+                                            "size_usd": size_usd,
+                                            "shares": actual_shares,
+                                            "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
+                                            "idempotency_key": idem_key,
+                                        })
+                                        daily_trades += 1
+                                        account_balance -= size_usd  # Running balance (H2 fix)
+                                        status = "EXECUTED"
+                                    except psycopg2.errors.UniqueViolation:
+                                        print(
+                                            f"[POLL-ACTIVE] {username}: DUPLICATE ORDER WARNING - "
+                                            f"UniqueViolation on idem_key {idem_key}. "
+                                            f"Order placed on-chain but another poll beat us. "
+                                            f"Manual reconciliation required for '{title}'."
+                                        )
+                                        send_alert("DUPLICATE_ORDER", {
+                                            "source_username": username,
+                                            "title": title,
+                                            "idempotency_key": idem_key,
+                                            "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
+                                        })
+                                        status = "DUPLICATE"
+                                else:
+                                    print(f"[POLL-ACTIVE] {username}: order not filled on '{title}' (FOK killed)")
+                                    status = "NOT FILLED"
 
                 entry_lines.append(
                     f"  - {outcome} @ {entry_price} — {title} [Size: ${size_usd:.2f}] [{status}]"
@@ -866,26 +814,32 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                         elif not is_trading_enabled():
                             exit_status = "KILL SWITCH"
                         else:
-                            sell_result = place_exit_order(
-                                token_id=token_id,
-                                shares=shares_to_sell,
-                                title=title,
-                            )
-                            if is_order_filled(sell_result):
-                                exit_price = extract_fill_price(sell_result)
-                                update_copy_trade_exit(our_trade["id"], "CLOSED", exit_price if exit_price > 0 else None)
-                                account_balance += (exit_price * shares_to_sell) if exit_price > 0 else 0
-                                exit_status = f"SOLD {shares_to_sell:.2f}"
-                                if exit_price > 0:
-                                    entry_p = float(our_trade.get("entry_price", 0) or 0)
-                                    pnl = (exit_price - entry_p) * shares_to_sell if entry_p > 0 else 0
-                                    print(f"[POLL-ACTIVE] {username}: sold {shares_to_sell:.2f} of '{title}' PnL=${pnl:+.2f}")
-                                else:
-                                    print(f"[POLL-ACTIVE] {username}: sold {shares_to_sell:.2f} of '{title}'")
+                            sell_price = get_order_price(token_id, side="sell")
+                            if sell_price <= 0:
+                                print(f"[POLL-ACTIVE] {username}: could not fetch sell price for '{title}', skipping")
+                                exit_status = "NO PRICE"
                             else:
-                                # C4 fix: don't mark closed — reconciliation will retry
-                                print(f"[POLL-ACTIVE] {username}: SELL not filled on '{title}' (FOK killed) — reconciliation will retry")
-                                exit_status = "SELL FAILED (will retry)"
+                                sell_result = place_exit_order(
+                                    token_id=token_id,
+                                    shares=shares_to_sell,
+                                    price=sell_price,
+                                    title=title,
+                                )
+                                if is_order_filled(sell_result):
+                                    exit_price = extract_fill_price(sell_result)
+                                    update_copy_trade_exit(our_trade["id"], "CLOSED", exit_price if exit_price > 0 else None)
+                                    account_balance += (exit_price * shares_to_sell) if exit_price > 0 else 0
+                                    exit_status = f"SOLD {shares_to_sell:.2f}"
+                                    if exit_price > 0:
+                                        entry_p = float(our_trade.get("entry_price", 0) or 0)
+                                        pnl = (exit_price - entry_p) * shares_to_sell if entry_p > 0 else 0
+                                        print(f"[POLL-ACTIVE] {username}: sold {shares_to_sell:.2f} of '{title}' PnL=${pnl:+.2f}")
+                                    else:
+                                        print(f"[POLL-ACTIVE] {username}: sold {shares_to_sell:.2f} of '{title}'")
+                                else:
+                                    # C4 fix: don't mark closed — reconciliation will retry
+                                    print(f"[POLL-ACTIVE] {username}: SELL not filled on '{title}' (FOK killed) — reconciliation will retry")
+                                    exit_status = "SELL FAILED (will retry)"
                     else:
                         exit_status = "NO COPY TRADE"
 
@@ -976,11 +930,16 @@ def run_reconciliation(dry_run: bool = True):
 
         print(f"[RECONCILE] Selling {shares_to_sell:.2f} shares of '{orphan['market_title']}'")
 
+        sell_price = get_order_price(token_id, side="sell")
+        if sell_price <= 0:
+            print(f"[RECONCILE] Could not fetch sell price for trade {trade_id} — will retry next cycle")
+            continue
+
         sell_result = place_copy_order(
             token_id=token_id,
             side="SELL",
-            amount=shares_to_sell,
-            title=orphan.get("market_title", ""),
+            size=shares_to_sell,
+            price=sell_price,
         )
 
         if is_order_filled(sell_result):
@@ -997,73 +956,6 @@ def run_reconciliation(dry_run: bool = True):
             print(f"[RECONCILE] Sell failed for trade {trade_id} — will retry next cycle")
 
     print(f"[RECONCILE] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
-
-
-# ============================================================
-# Test order function (H4 — discover real CLOB response schema)
-# ============================================================
-
-def test_live_order():
-    """
-    Place a $1 test order and print the FULL response.
-    Run ONCE manually to discover field names before going live.
-
-    Usage:
-      python -c "from copy_trader import test_live_order; test_live_order()"
-    """
-    from py_clob_client.clob_types import MarketOrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY
-
-    clob = get_clob_client()
-    if not clob:
-        print("ERROR: Could not initialize CLOB client")
-        return None
-
-    # PASTE A REAL TOKEN ID HERE before running.
-    # Find one at: https://gamma-api.polymarket.com/markets?closed=false&limit=5
-    # Use a clobTokenIds value from a liquid market.
-    TEST_TOKEN_ID = "PASTE_A_REAL_TOKEN_ID_HERE"
-
-    if "PASTE" in TEST_TOKEN_ID:
-        print("ERROR: Replace TEST_TOKEN_ID with a real token ID first!")
-        print("  Find one at: https://gamma-api.polymarket.com/markets?closed=false&limit=5")
-        return None
-
-    print("=" * 60)
-    print("TEST: Placing $1 FOK BUY order")
-    print(f"Token: {TEST_TOKEN_ID[:40]}...")
-    print("=" * 60)
-
-    try:
-        mo = MarketOrderArgs(
-            token_id=TEST_TOKEN_ID,
-            amount=1.0,
-            side=BUY,
-        )
-        signed_order = clob.create_market_order(mo)
-        result = clob.post_order(signed_order, OrderType.FOK)
-
-        print(f"\nResponse type: {type(result)}")
-        print(f"Raw response: {result}")
-
-        if isinstance(result, dict):
-            print("\nField breakdown:")
-            for key, value in result.items():
-                print(f"  {key}: {value} (type: {type(value).__name__})")
-
-        print("\n" + "=" * 60)
-        print("UPDATE THESE FUNCTIONS with the real field names above:")
-        print("  - extract_fill_shares()")
-        print("  - extract_fill_price()")
-        print("  - is_order_filled()")
-        print("=" * 60)
-
-        return result
-    except Exception as e:
-        print(f"\nOrder FAILED: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
 
 
 # ============================================================
@@ -1088,9 +980,7 @@ if __name__ == "__main__":
             print("Aborted.")
             sys.exit(0)
 
-    if "--test-order" in sys.argv:
-        test_live_order()
-    elif "--reconcile" in sys.argv:
+    if "--reconcile" in sys.argv:
         run_reconciliation(dry_run=dry_run)
     else:
         poll_followed_traders(dry_run=dry_run, mode="normal")
