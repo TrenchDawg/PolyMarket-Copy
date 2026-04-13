@@ -115,15 +115,16 @@ def make_idempotency_key(source_wallet: str, asset_id: str) -> str:
 
 def is_order_filled(order_result) -> bool:
     """
-    Determine whether a FOK market-order response actually represents a fill.
+    Determine whether a CLOB order response represents a successful placement.
 
-    Defaults to False. A response is only treated as filled when we can see
-    an explicit positive fill amount. The presence of an orderID is NOT
-    sufficient — py_clob_client returns an orderID on any accepted request,
-    including FOK orders that matched zero shares.
+    Real CLOB response shape:
+        {"success": True, "status": "live"|"matched"|"filled", "orderID": "0x...",
+         "errorMsg": "", "takingAmount": "", "makingAmount": ""}
 
-    Unknown response shapes are logged once per call so the field list can
-    be extended after the first live run reveals the real schema.
+    - success must be True
+    - status "live" = limit order on the book (accepted, not yet matched)
+    - status "matched"/"filled" = immediately filled
+    - Any other status or success=False → not filled
     """
     if not order_result:
         return False
@@ -131,38 +132,16 @@ def is_order_filled(order_result) -> bool:
         print(f"[ORDER] is_order_filled: unexpected response type {type(order_result).__name__}, treating as unfilled")
         return False
 
-    status = str(order_result.get("status", "")).upper()
-    if status in {"KILLED", "CANCELLED", "CANCELED", "REJECTED", "FAILED", "UNMATCHED", "EXPIRED"}:
-        return False
-    if order_result.get("success") is False:
+    if order_result.get("success") is not True:
         return False
     if order_result.get("errorMsg"):
         return False
 
-    def _as_float(val) -> float:
-        try:
-            return float(val) if val is not None else 0.0
-        except (TypeError, ValueError):
-            return 0.0
-
-    # Positive fill indicator required. Add new field names here as we see
-    # them in real responses during the shadow-trading period.
-    filled_candidates = [
-        order_result.get("filledSize"),
-        order_result.get("filled_size"),
-        order_result.get("matchedSize"),
-        order_result.get("matched_size"),
-        order_result.get("sizeMatched"),
-    ]
-    for candidate in filled_candidates:
-        if _as_float(candidate) > 0:
-            return True
-
-    # Known "matched" statuses with no explicit size field but a clean shape
-    if status in {"MATCHED", "FILLED"}:
+    status = str(order_result.get("status", "")).lower()
+    if status in ("live", "matched", "filled"):
         return True
 
-    print(f"[ORDER] is_order_filled: no positive fill indicator in response, treating as unfilled: {order_result}")
+    print(f"[ORDER] is_order_filled: unexpected status '{status}' in response: {order_result}")
     return False
 
 
@@ -170,12 +149,36 @@ def extract_fill_shares(order_result: dict) -> float:
     """
     Extract actual filled share quantity from CLOB order response.
 
-    UPDATE THESE FIELD NAMES after running test_live_order() with a real
-    $1 order and inspecting the response.
+    Real CLOB response shape:
+        {"success": True, "status": "live"|"matched"|"filled",
+         "orderID": "0x...", "errorMsg": "",
+         "takingAmount": "", "makingAmount": ""}
+
+    - "live" status = limit order on the book, no shares filled yet → return 0
+    - "matched" status = check takingAmount and makingAmount for fill data
     """
     if not order_result or not isinstance(order_result, dict):
         return 0.0
 
+    status = str(order_result.get("status", "")).lower()
+
+    # "live" means the order is sitting on the book — nothing filled yet
+    if status == "live":
+        return 0.0
+
+    # For "matched"/"filled", check takingAmount and makingAmount
+    if status in ("matched", "filled"):
+        for field in ["takingAmount", "makingAmount"]:
+            val = order_result.get(field)
+            if val:
+                try:
+                    f = float(val)
+                    if f > 0:
+                        return f
+                except (ValueError, TypeError):
+                    continue
+
+    # Fallback: try legacy field names
     for field in ["filledSize", "filled_size", "matchedSize", "matched_size",
                    "sizeMatched", "size", "executedQty"]:
         val = order_result.get(field)
@@ -266,7 +269,23 @@ def prune_stale_active_traders(window_minutes: int):
 # Order execution (via Madrid proxy)
 # ============================================================
 
-def place_copy_order(token_id: str, side: str, size: float, price: float) -> dict:
+def get_token_market_params(condition_id: str) -> tuple:
+    """Fetch tick_size and neg_risk for a market from the CLOB API."""
+    if not condition_id:
+        return "0.01", False
+    try:
+        info = client.get_market_info(condition_id)
+        if info:
+            tick_size = str(info.get("minimum_tick_size", "0.01"))
+            neg_risk = bool(info.get("neg_risk", False))
+            return tick_size, neg_risk
+    except Exception as e:
+        print(f"[ORDER] Failed to fetch market params for {condition_id[:30]}: {e}")
+    return "0.01", False
+
+
+def place_copy_order(token_id: str, side: str, size: float, price: float,
+                     tick_size: str = "0.01", neg_risk: bool = False) -> dict:
     """Place an order via the Madrid order proxy."""
     import requests
     from config import ORDER_PROXY_URL, ORDER_PROXY_AUTH_TOKEN
@@ -274,7 +293,14 @@ def place_copy_order(token_id: str, side: str, size: float, price: float) -> dic
     try:
         resp = requests.post(
             f"{ORDER_PROXY_URL}/execute-order",
-            json={"token_id": token_id, "side": side, "size": size, "price": price},
+            json={
+                "token_id": token_id,
+                "side": side,
+                "size": size,
+                "price": price,
+                "tick_size": tick_size,
+                "neg_risk": neg_risk,
+            },
             headers={"Authorization": f"Bearer {ORDER_PROXY_AUTH_TOKEN}"},
             timeout=30,
         )
@@ -289,9 +315,12 @@ def place_copy_order(token_id: str, side: str, size: float, price: float) -> dic
         return None
 
 
-def place_exit_order(token_id: str, shares: float, price: float, title: str = "") -> Optional[dict]:
+def place_exit_order(token_id: str, shares: float, price: float,
+                     title: str = "", condition_id: str = "") -> Optional[dict]:
     """Sell/exit a position by selling all shares via proxy."""
-    return place_copy_order(token_id=token_id, side="SELL", size=shares, price=price)
+    exit_tick, exit_neg = get_token_market_params(condition_id)
+    return place_copy_order(token_id=token_id, side="SELL", size=shares, price=price,
+                            tick_size=exit_tick, neg_risk=exit_neg)
 
 
 def get_order_price(token_id: str, side: str = "buy") -> float:
@@ -718,11 +747,14 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                             else:
                                 buy_size = round_to_tick(size_usd / order_price, LOT_SIZE)
                                 print(f"[POLL-ACTIVE] U-size: ${size_usd:.2f} (balance=${account_balance:.0f}, price={order_price:.2f}, shares={buy_size:.2f})")
+                                mkt_tick, mkt_neg = get_token_market_params(pos.get("conditionId", ""))
                                 order_result = place_copy_order(
                                     token_id=token_id,
                                     side="BUY",
                                     size=buy_size,
                                     price=order_price,
+                                    tick_size=mkt_tick,
+                                    neg_risk=mkt_neg,
                                 )
                                 if is_order_filled(order_result):
                                     # Extract real fill data (C1 fix)
@@ -824,6 +856,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                     shares=shares_to_sell,
                                     price=sell_price,
                                     title=title,
+                                    condition_id=pos.get("condition_id", ""),
                                 )
                                 if is_order_filled(sell_result):
                                     exit_price = extract_fill_price(sell_result)
@@ -935,11 +968,14 @@ def run_reconciliation(dry_run: bool = True):
             print(f"[RECONCILE] Could not fetch sell price for trade {trade_id} — will retry next cycle")
             continue
 
+        sell_tick, sell_neg = get_token_market_params(orphan.get("condition_id", ""))
         sell_result = place_copy_order(
             token_id=token_id,
             side="SELL",
             size=shares_to_sell,
             price=sell_price,
+            tick_size=sell_tick,
+            neg_risk=sell_neg,
         )
 
         if is_order_filled(sell_result):

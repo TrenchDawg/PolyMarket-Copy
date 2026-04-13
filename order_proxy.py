@@ -24,6 +24,7 @@ POLY_PRIVATE_KEY = os.getenv("POLY_PRIVATE_KEY", "")
 POLY_API_KEY = os.getenv("POLY_API_KEY", "")
 POLY_API_SECRET = os.getenv("POLY_API_SECRET", "")
 POLY_API_PASSPHRASE = os.getenv("POLY_API_PASSPHRASE", "")
+POLY_WALLET_ADDRESS = os.getenv("POLY_WALLET_ADDRESS", "")
 
 _clob_client = None
 
@@ -51,6 +52,7 @@ def get_clob_client():
             key=POLY_PRIVATE_KEY,
             chain_id=137,
             signature_type=1,
+            funder=POLY_WALLET_ADDRESS,
             creds=creds,
         )
         print("[PROXY] CLOB client initialized")
@@ -178,16 +180,21 @@ def execute_order():
                 "success": False,
             }), 400
 
-        print(f"[PROXY] Placing {side} order: {size} shares @ ${price} for token {token_id[:30]}...")
+        tick_size = data.get("tick_size", "0.01")
+        neg_risk = data.get("neg_risk", False)
 
-        from py_clob_client.clob_types import OrderArgs
+        print(f"[PROXY] Placing {side} order: {size} shares @ ${price} for token {token_id[:30]}... (tick={tick_size}, neg_risk={neg_risk})")
+
+        from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
+        options = CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
         result = clob.create_and_post_order(
             OrderArgs(
                 token_id=token_id,
                 price=price,
                 size=size,
                 side=side,
-            )
+            ),
+            options=options,
         )
 
         print(f"[PROXY] Order result: {result}")

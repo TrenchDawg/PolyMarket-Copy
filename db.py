@@ -438,7 +438,7 @@ def get_orphaned_copy_trades() -> list:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT ct.id, ct.source_wallet, ct.source_username, ct.token_id,
-                       ct.shares, ct.market_title, ct.outcome, ct.entry_price
+                       ct.condition_id, ct.shares, ct.market_title, ct.outcome, ct.entry_price
                 FROM copy_trades ct
                 LEFT JOIN followed_positions fp
                     ON ct.source_wallet = fp.proxy_wallet AND ct.token_id = fp.asset_id

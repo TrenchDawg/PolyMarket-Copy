@@ -231,6 +231,12 @@ class PolymarketClient:
             params={"token_id": token_id}
         )
 
+    def get_market_info(self, condition_id: str) -> Optional[dict]:
+        """Get market metadata (tick_size, neg_risk, etc.) from the CLOB API."""
+        return self._get(
+            f"{POLYMARKET_CLOB_API}/markets/{condition_id}",
+        )
+
     # ============================================================
     # Market holders
     # ============================================================

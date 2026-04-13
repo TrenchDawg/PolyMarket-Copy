@@ -63,7 +63,7 @@ PARTIAL_SIZE_CHANGE_THRESHOLD = 0.20  # Alert if trader resizes a position by mo
 # ============================================================
 TICK_SIZE = 0.01        # minimum price increment (1 cent)
 LOT_SIZE = 0.01         # minimum order size increment
-MIN_ORDER_SIZE = 1.00   # minimum order notional in USD
+MIN_ORDER_SIZE = 5.00   # Polymarket minimum is 5 shares
 
 # ============================================================
 # Open position health check
