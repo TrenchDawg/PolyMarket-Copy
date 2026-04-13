@@ -1,0 +1,7 @@
+# Dependencies for the Madrid VPS order proxy (order_proxy.py).
+# These are NOT needed by Railway — they are installed on the VPS
+# via setup_vps.sh. This file exists as a reference for rebuilds.
+flask>=3.0.0
+gunicorn>=21.2.0
+py-clob-client>=0.2.0
+requests>=2.31.0

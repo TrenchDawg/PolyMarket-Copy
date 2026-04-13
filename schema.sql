@@ -96,11 +96,14 @@ CREATE TABLE IF NOT EXISTS copy_trades (
 CREATE INDEX IF NOT EXISTS idx_copy_trades_status ON copy_trades(status);
 CREATE INDEX IF NOT EXISTS idx_copy_trades_source ON copy_trades(source_wallet);
 
--- Idempotency: only OPEN copy_trades must have a unique key. Once a trade is
--- CLOSED the same (source, token) can be re-entered without conflict.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_trades_idem_open
+-- Idempotency: OPEN and PENDING copy_trades must have a unique key. Once a trade is
+-- CLOSED/FAILED the same (source, token) can be re-entered without conflict.
+-- PENDING records are created BEFORE order placement (B-04 fix) so a crash
+-- between order and DB update still leaves a visible breadcrumb.
+DROP INDEX IF EXISTS idx_copy_trades_idem_open;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_copy_trades_idem_active
     ON copy_trades(idempotency_key)
-    WHERE status = 'OPEN' AND idempotency_key IS NOT NULL;
+    WHERE status IN ('OPEN', 'PENDING') AND idempotency_key IS NOT NULL;
 
 -- Migration step 1: add the idempotency_key column on existing tables
 DO $$

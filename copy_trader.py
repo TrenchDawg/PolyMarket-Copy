@@ -18,6 +18,7 @@ from config import (
     MAX_DAILY_TRADES,
     MAX_SPREAD_PCT,
     MAX_TRADE_SIZE_USD,
+    DAILY_LOSS_LIMIT_USD,
     ALERT_WEBHOOK_URL,
     PARTIAL_SIZE_CHANGE_THRESHOLD,
     TRADE_SIZE_FLOOR_PCT,
@@ -33,8 +34,12 @@ from config import (
 from db import (
     get_followed_traders,
     log_copy_trade,
+    log_pending_copy_trade,
+    update_pending_to_open,
+    update_pending_to_failed,
     is_trading_enabled,
     get_config,
+    set_config,
     log_alert,
     get_followed_open_positions,
     upsert_followed_position,
@@ -45,6 +50,7 @@ from db import (
     update_copy_trade_exit,
     has_pending_copy_trade,
     get_orphaned_copy_trades,
+    get_daily_realized_pnl,
     get_conn,
     release_conn,
 )
@@ -198,9 +204,20 @@ def extract_fill_price(order_result: dict) -> float:
     """
     Extract average fill price from CLOB order response.
 
-    UPDATE THESE FIELD NAMES after running test_live_order().
+    Real CLOB response shape:
+        {"success": True, "status": "live"|"matched"|"filled",
+         "orderID": "0x...", "errorMsg": "",
+         "takingAmount": "", "makingAmount": ""}
+
+    The CLOB response has no explicit fill price field.
+    - "live" = limit order on book, no fill yet -> return 0 (caller uses order price)
+    - "matched"/"filled" = check for price fields from py-clob-client wrapper
     """
     if not order_result or not isinstance(order_result, dict):
+        return 0.0
+
+    status = str(order_result.get("status", "")).lower()
+    if status == "live":
         return 0.0
 
     for field in ["avgPrice", "avg_price", "price", "averagePrice"]:
@@ -667,6 +684,20 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
         except (TypeError, ValueError):
             max_daily = MAX_DAILY_TRADES
 
+        # B-02 fix: check daily realized loss limit before placing any orders
+        if live_trading:
+            try:
+                daily_pnl = get_daily_realized_pnl()
+                if daily_pnl < -DAILY_LOSS_LIMIT_USD:
+                    set_config("kill_switch", "OFF")
+                    send_alert("CIRCUIT_BREAKER", {
+                        "reason": f"Daily loss limit exceeded: ${daily_pnl:.2f} (limit: -${DAILY_LOSS_LIMIT_USD:.2f})",
+                    })
+                    print(f"[SAFETY] Daily loss limit exceeded (${daily_pnl:.2f}), kill switch auto-disabled")
+                    live_trading = False
+            except Exception as e:
+                print(f"[POLL-ACTIVE] Could not check daily PnL: {e}")
+
     for trader in followed:
         wallet = trader["proxy_wallet"]
         username = trader.get("username", wallet[:10])
@@ -748,60 +779,62 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                 buy_size = round_to_tick(size_usd / order_price, LOT_SIZE)
                                 print(f"[POLL-ACTIVE] U-size: ${size_usd:.2f} (balance=${account_balance:.0f}, price={order_price:.2f}, shares={buy_size:.2f})")
                                 mkt_tick, mkt_neg = get_token_market_params(pos.get("conditionId", ""))
-                                order_result = place_copy_order(
-                                    token_id=token_id,
-                                    side="BUY",
-                                    size=buy_size,
-                                    price=order_price,
-                                    tick_size=mkt_tick,
-                                    neg_risk=mkt_neg,
-                                )
-                                if is_order_filled(order_result):
-                                    # Extract real fill data (C1 fix)
-                                    actual_shares = extract_fill_shares(order_result)
-                                    actual_price = extract_fill_price(order_result)
-                                    if actual_shares <= 0:
-                                        print(f"[ORDER] WARNING: Using estimated shares (extraction failed)")
-                                        actual_shares = size_usd / order_price if order_price > 0 else 0
-                                    if actual_price <= 0:
-                                        actual_price = order_price
 
-                                    try:
-                                        log_copy_trade({
-                                            "source_wallet": wallet,
-                                            "source_username": username,
-                                            "condition_id": pos.get("conditionId", ""),
-                                            "token_id": token_id,
-                                            "market_title": title,
-                                            "market_slug": pos.get("slug", ""),
-                                            "outcome": outcome,
-                                            "side": "BUY",
-                                            "entry_price": actual_price,
-                                            "size_usd": size_usd,
-                                            "shares": actual_shares,
-                                            "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
-                                            "idempotency_key": idem_key,
-                                        })
+                                # B-04 fix: write PENDING record BEFORE placing the order.
+                                # If we crash after the order but before the DB update,
+                                # the PENDING record survives for reconciliation.
+                                pending_id = None
+                                try:
+                                    pending_id = log_pending_copy_trade({
+                                        "source_wallet": wallet,
+                                        "source_username": username,
+                                        "condition_id": pos.get("conditionId", ""),
+                                        "token_id": token_id,
+                                        "market_title": title,
+                                        "market_slug": pos.get("slug", ""),
+                                        "outcome": outcome,
+                                        "side": "BUY",
+                                        "size_usd": size_usd,
+                                        "idempotency_key": idem_key,
+                                    })
+                                except psycopg2.errors.UniqueViolation:
+                                    print(
+                                        f"[POLL-ACTIVE] {username}: DUPLICATE — "
+                                        f"PENDING/OPEN record already exists for {idem_key}"
+                                    )
+                                    send_alert("DUPLICATE_ORDER", {
+                                        "source_username": username,
+                                        "title": title,
+                                        "idempotency_key": idem_key,
+                                    })
+                                    status = "DUPLICATE"
+
+                                if pending_id:
+                                    order_result = place_copy_order(
+                                        token_id=token_id,
+                                        side="BUY",
+                                        size=buy_size,
+                                        price=order_price,
+                                        tick_size=mkt_tick,
+                                        neg_risk=mkt_neg,
+                                    )
+                                    if is_order_filled(order_result):
+                                        actual_shares = extract_fill_shares(order_result)
+                                        actual_price = extract_fill_price(order_result)
+                                        if actual_shares <= 0:
+                                            print(f"[ORDER] WARNING: Using estimated shares (extraction failed)")
+                                            actual_shares = size_usd / order_price if order_price > 0 else 0
+                                        if actual_price <= 0:
+                                            actual_price = order_price
+                                        order_id = str(order_result.get("orderID", "") or order_result.get("orderId", ""))
+                                        update_pending_to_open(pending_id, order_id, actual_price, actual_shares)
                                         daily_trades += 1
-                                        account_balance -= size_usd  # Running balance (H2 fix)
+                                        account_balance -= size_usd
                                         status = "EXECUTED"
-                                    except psycopg2.errors.UniqueViolation:
-                                        print(
-                                            f"[POLL-ACTIVE] {username}: DUPLICATE ORDER WARNING - "
-                                            f"UniqueViolation on idem_key {idem_key}. "
-                                            f"Order placed on-chain but another poll beat us. "
-                                            f"Manual reconciliation required for '{title}'."
-                                        )
-                                        send_alert("DUPLICATE_ORDER", {
-                                            "source_username": username,
-                                            "title": title,
-                                            "idempotency_key": idem_key,
-                                            "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
-                                        })
-                                        status = "DUPLICATE"
-                                else:
-                                    print(f"[POLL-ACTIVE] {username}: order not filled on '{title}' (FOK killed)")
-                                    status = "NOT FILLED"
+                                    else:
+                                        update_pending_to_failed(pending_id)
+                                        print(f"[POLL-ACTIVE] {username}: order not filled on '{title}' (FOK killed)")
+                                        status = "NOT FILLED"
 
                 entry_lines.append(
                     f"  - {outcome} @ {entry_price} — {title} [Size: ${size_usd:.2f}] [{status}]"

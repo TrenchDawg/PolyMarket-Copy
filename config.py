@@ -55,6 +55,7 @@ REALTIME_ALERT_MAX_POSITIONS = 50  # Only send real-time alerts for traders with
 # ============================================================
 MAX_TRADE_SIZE_USD = 50.0            # Hard cap regardless of account size
 MAX_DAILY_TRADES = 10               # circuit breaker
+DAILY_LOSS_LIMIT_USD = 25.0         # auto-disable kill switch if realized losses today exceed this
 MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
 PARTIAL_SIZE_CHANGE_THRESHOLD = 0.20  # Alert if trader resizes a position by more than 20%
 

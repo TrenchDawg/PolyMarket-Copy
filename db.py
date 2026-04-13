@@ -352,10 +352,77 @@ def log_copy_trade(trade: dict):
         release_conn(conn)
 
 
+def log_pending_copy_trade(trade: dict) -> int:
+    """
+    Insert a PENDING copy trade BEFORE placing the order on-chain (B-04 fix).
+    Returns the trade ID so the caller can update it after order execution.
+
+    If the order succeeds  -> caller calls update_pending_to_open()
+    If the order fails     -> caller calls update_pending_to_failed()
+    If the process crashes -> PENDING record survives for reconciliation
+    """
+    trade = dict(trade)
+    trade.setdefault("idempotency_key", None)
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO copy_trades (
+                    source_wallet, source_username, condition_id,
+                    token_id, market_title, market_slug, outcome,
+                    side, size_usd, idempotency_key, status
+                ) VALUES (
+                    %(source_wallet)s, %(source_username)s, %(condition_id)s,
+                    %(token_id)s, %(market_title)s, %(market_slug)s, %(outcome)s,
+                    %(side)s, %(size_usd)s, %(idempotency_key)s, 'PENDING'
+                )
+                RETURNING id
+            """, trade)
+            trade_id = cur.fetchone()[0]
+        conn.commit()
+        return trade_id
+    finally:
+        release_conn(conn)
+
+
+def update_pending_to_open(trade_id: int, order_id: str, entry_price: float, shares: float):
+    """Update a PENDING copy trade to OPEN with fill details after successful order."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET status = 'OPEN',
+                    order_id = %s,
+                    entry_price = %s,
+                    shares = %s
+                WHERE id = %s AND status = 'PENDING'
+            """, (order_id, entry_price, shares, trade_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def update_pending_to_failed(trade_id: int):
+    """Mark a PENDING copy trade as FAILED (order not filled or placement failed)."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET status = 'FAILED',
+                    resolved_at = NOW()
+                WHERE id = %s AND status = 'PENDING'
+            """, (trade_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
 def has_pending_copy_trade(idempotency_key: str) -> bool:
     """
     Return True if we already have a copy_trade with this idempotency key
-    and the trade is still OPEN. Used to short-circuit duplicate order
+    that is OPEN or PENDING. Used to short-circuit duplicate order
     placement across overlapping polls or post-crash recovery.
     """
     if not idempotency_key:
@@ -367,7 +434,7 @@ def has_pending_copy_trade(idempotency_key: str) -> bool:
                 SELECT EXISTS(
                     SELECT 1 FROM copy_trades
                     WHERE idempotency_key = %s
-                      AND status = 'OPEN'
+                      AND status IN ('OPEN', 'PENDING')
                 )
             """, (idempotency_key,))
             return bool(cur.fetchone()[0])
@@ -597,6 +664,22 @@ def has_baseline_snapshot(wallet: str) -> bool:
                 )
             """, (wallet,))
             return cur.fetchone()[0]
+    finally:
+        release_conn(conn)
+
+
+def get_daily_realized_pnl() -> float:
+    """Sum of realized PnL for trades closed today. Negative = losses."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COALESCE(SUM(pnl), 0)
+                FROM copy_trades
+                WHERE resolved_at::date = CURRENT_DATE
+                  AND pnl IS NOT NULL
+            """)
+            return float(cur.fetchone()[0])
     finally:
         release_conn(conn)
 
