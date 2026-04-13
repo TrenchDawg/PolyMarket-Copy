@@ -157,7 +157,7 @@ def main():
         print(f"Balance: {bal}")
 
         # Get price for test token
-        TEST_TOKEN = "42226471287631305147124009130697472279390700811292616532685434752232432877995"
+        TEST_TOKEN = "101166376461992800720158539660705457991918987283183014469033932142867303641877"
         price_data = requests.get(f"{ORDER_PROXY_URL}/price", params={"token_id": TEST_TOKEN, "side": "buy"}, headers=headers).json()
         print(f"Price: {price_data}")
         p = float(price_data.get("price", 0))
