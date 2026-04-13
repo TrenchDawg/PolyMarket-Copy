@@ -167,20 +167,6 @@ def main():
         run_reconciliation(dry_run=DRY_RUN)
         return
 
-    if "--test-order" in sys.argv:
-        from copy_trader import get_clob_client
-        from py_clob_client.clob_types import OrderArgs
-        clob = get_clob_client()
-        price = clob.get_price('42226471287631305147124009130697472279390700811292616532685434752232432877995', 'buy')
-        print(f"Celtics price: {price}")
-        p = float(price['price'])
-        result = clob.create_and_post_order(OrderArgs(token_id='42226471287631305147124009130697472279390700811292616532685434752232432877995', price=p, size=round(1.0/p, 2), side='BUY'))
-        print(f"Result: {result}")
-        if isinstance(result, dict):
-            for k, v in result.items():
-                print(f"  {k}: {v} ({type(v).__name__})")
-        sys.exit(0)
-
     # Set up signal handlers
     signal.signal(signal.SIGINT, graceful_shutdown)
     signal.signal(signal.SIGTERM, graceful_shutdown)
