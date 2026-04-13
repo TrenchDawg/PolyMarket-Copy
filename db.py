@@ -406,6 +406,50 @@ def update_copy_trade_status(trade_id: int, status: str):
         release_conn(conn)
 
 
+def update_copy_trade_exit(trade_id: int, status: str, exit_price: float = None):
+    """Update copy trade with exit price and computed PnL."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET status = %s,
+                    exit_price = %s,
+                    resolved_at = NOW(),
+                    pnl = CASE
+                        WHEN %s IS NOT NULL AND entry_price IS NOT NULL AND shares IS NOT NULL
+                        THEN (%s - entry_price) * shares
+                        ELSE NULL
+                    END
+                WHERE id = %s
+            """, (status, exit_price, exit_price, exit_price, trade_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def get_orphaned_copy_trades() -> list:
+    """
+    Find copy_trades that are OPEN but the source trader has already exited
+    (followed_position is CLOSED or missing).
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT ct.id, ct.source_wallet, ct.source_username, ct.token_id,
+                       ct.shares, ct.market_title, ct.outcome, ct.entry_price
+                FROM copy_trades ct
+                LEFT JOIN followed_positions fp
+                    ON ct.source_wallet = fp.proxy_wallet AND ct.token_id = fp.asset_id
+                WHERE ct.status = 'OPEN'
+                  AND (fp.status = 'CLOSED' OR fp.status IS NULL)
+            """)
+            return cur.fetchall()
+    finally:
+        release_conn(conn)
+
+
 # ============================================================
 # System config operations
 # ============================================================
@@ -442,16 +486,20 @@ def is_trading_enabled() -> bool:
     Returns True if live trading is enabled, False if alert-only mode.
 
     DB convention: 'ON' = trading enabled, 'OFF' or missing = trading disabled.
-    Fail-safe default: anything other than 'ON' returns False.
+    Fail-safe default: ANY exception or non-'ON' value returns False.
     """
-    conn = get_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM system_config WHERE key = 'kill_switch'")
-            row = cur.fetchone()
-            return bool(row) and row[0] == 'ON'
-    finally:
-        release_conn(conn)
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM system_config WHERE key = 'kill_switch'")
+                row = cur.fetchone()
+                return bool(row) and row[0] == 'ON'
+        finally:
+            release_conn(conn)
+    except Exception as e:
+        print(f"[SAFETY] Kill switch check failed: {e} — defaulting to DISABLED")
+        return False
 
 
 # ============================================================

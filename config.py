@@ -46,6 +46,7 @@ LEADERBOARD_MAX_PAGES = 6        # 50 * 6 = 300 traders per period
 POSITION_POLL_SECONDS = 120      # normal poll: check all followed traders every 2 minutes
 ACTIVE_TRADER_POLL_SECONDS = 30  # poll every 30s for traders with recent activity
 ACTIVE_TRADER_WINDOW_MINUTES = 10  # how long a trader stays in "active" mode after a detected entry or exit
+RECONCILIATION_INTERVAL_SECONDS = 300  # reconciliation: check for orphaned positions every 5 minutes
 ALERT_SUMMARY_HOUR = 20          # daily summary at 8pm
 REALTIME_ALERT_MAX_POSITIONS = 50  # Only send real-time alerts for traders with ≤ 50 open positions
 

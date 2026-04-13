@@ -5,6 +5,7 @@ Polls followed traders for new positions and mirrors their trades.
 Includes kill switch, circuit breakers, and liquidity checks.
 """
 import math
+import threading
 import time
 import requests
 from datetime import datetime, timezone
@@ -51,7 +52,9 @@ from db import (
     has_baseline_snapshot,
     get_copy_trade_for_token,
     update_copy_trade_status,
+    update_copy_trade_exit,
     has_pending_copy_trade,
+    get_orphaned_copy_trades,
     get_conn,
     release_conn,
 )
@@ -173,20 +176,100 @@ def is_order_filled(order_result) -> bool:
     return False
 
 
+def extract_fill_shares(order_result: dict) -> float:
+    """
+    Extract actual filled share quantity from CLOB order response.
+
+    UPDATE THESE FIELD NAMES after running test_live_order() with a real
+    $1 order and inspecting the response.
+    """
+    if not order_result or not isinstance(order_result, dict):
+        return 0.0
+
+    for field in ["filledSize", "filled_size", "matchedSize", "matched_size",
+                   "sizeMatched", "size", "executedQty"]:
+        val = order_result.get(field)
+        if val is not None:
+            try:
+                f = float(val)
+                if f > 0:
+                    return f
+            except (ValueError, TypeError):
+                continue
+
+    print(f"[ORDER] WARNING: Could not extract fill shares from response: {order_result}")
+    return 0.0
+
+
+def extract_fill_price(order_result: dict) -> float:
+    """
+    Extract average fill price from CLOB order response.
+
+    UPDATE THESE FIELD NAMES after running test_live_order().
+    """
+    if not order_result or not isinstance(order_result, dict):
+        return 0.0
+
+    for field in ["avgPrice", "avg_price", "price", "averagePrice"]:
+        val = order_result.get(field)
+        if val is not None:
+            try:
+                f = float(val)
+                if f > 0:
+                    return f
+            except (ValueError, TypeError):
+                continue
+
+    return 0.0
+
+
 client = PolymarketClient()
 
 
 # ============================================================
-# Active-trader tracking (adaptive polling)
+# Active-trader tracking (thread-safe, adaptive polling)
 # ============================================================
 
+_active_traders_lock = threading.Lock()
 _active_traders = {}   # {proxy_wallet: datetime_of_last_activity}
 _last_polled_at = {}   # {proxy_wallet: datetime_of_last_poll}
 
 
-def get_active_traders() -> dict:
-    """Return the active traders dict (for use by main.py scheduler)."""
-    return _active_traders
+def add_active_trader(wallet: str):
+    """Mark a trader as recently active (thread-safe)."""
+    with _active_traders_lock:
+        _active_traders[wallet] = datetime.now(timezone.utc)
+
+
+def get_active_traders_snapshot() -> dict:
+    """Return a snapshot copy of active traders (thread-safe)."""
+    with _active_traders_lock:
+        return dict(_active_traders)
+
+
+def update_last_polled(wallet: str):
+    """Record when we last polled this wallet (thread-safe)."""
+    with _active_traders_lock:
+        _last_polled_at[wallet] = datetime.now(timezone.utc)
+
+
+def was_recently_polled(wallet: str, seconds: int = 25) -> bool:
+    """Check if wallet was polled within the last N seconds (thread-safe)."""
+    with _active_traders_lock:
+        last = _last_polled_at.get(wallet)
+        if not last:
+            return False
+        return (datetime.now(timezone.utc) - last).total_seconds() < seconds
+
+
+def prune_stale_active_traders(window_minutes: int):
+    """Remove traders who haven't had activity within the window (thread-safe)."""
+    with _active_traders_lock:
+        now = datetime.now(timezone.utc)
+        stale = [w for w, t in _active_traders.items()
+                 if (now - t).total_seconds() > window_minutes * 60]
+        for w in stale:
+            del _active_traders[w]
 
 
 # ============================================================
@@ -547,87 +630,71 @@ def send_alert(alert_type: str, payload: dict):
 
 
 # ============================================================
-# Main polling loop
+# Main polling loop — three-job architecture
+#
+# Normal poller  (every 2 min):  detection + DB writes + alerts. NO orders.
+# Active poller  (every 30 sec): fast-poll active traders, places BUY/SELL.
+# Reconciliation (every 5 min):  catches orphaned positions, places SELL.
 # ============================================================
 
 def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
     """
-    Single poll cycle: check followed traders for new positions.
+    Single poll cycle: check followed traders for position changes.
 
-    mode="normal"  — poll ALL followed traders (every 2 min)
-    mode="active"  — poll only traders with recent activity (every 30s)
-
-    Live trading only happens when:
-      - dry_run is False, AND
-      - is_trading_enabled() returns True (kill switch = 'ON' in DB).
-
-    All pre-flight safety checks (spread, circuit breaker, position sizing)
-    run inside the per-position loop, not in a separate unreachable function.
+    mode="normal"  — poll ALL followed traders. Detection and alerts only.
+                     Never places orders. Adds active traders to the fast-poll set.
+    mode="active"  — poll only recently-active traders. Places BUY and SELL orders.
     """
-    from datetime import timedelta
-
-    now = datetime.now(timezone.utc)
-
     followed = get_followed_traders()
     if not followed:
         print("[POLL] No followed traders. Run trader_ranker.py first.")
         return
 
     if mode == "active":
-        # Prune stale entries from _active_traders
-        cutoff = now - timedelta(minutes=ACTIVE_TRADER_WINDOW_MINUTES)
-        stale = [w for w, ts in _active_traders.items() if ts < cutoff]
-        for w in stale:
-            del _active_traders[w]
+        prune_stale_active_traders(ACTIVE_TRADER_WINDOW_MINUTES)
 
-        if not _active_traders:
-            return  # no active traders — skip entirely, no API calls
+        active_snapshot = get_active_traders_snapshot()
+        if not active_snapshot:
+            return  # no active traders — skip entirely
 
-        # Filter to only active traders
-        active_wallets = set(_active_traders.keys())
+        active_wallets = set(active_snapshot.keys())
         followed = [t for t in followed if t["proxy_wallet"] in active_wallets]
-
         if not followed:
             return
 
-        # Skip traders polled within the last 25 seconds (avoid duplicate calls
-        # when the normal poll just ran)
-        followed = [
-            t for t in followed
-            if (now - _last_polled_at.get(t["proxy_wallet"], datetime.min.replace(tzinfo=timezone.utc))).total_seconds() > 25
-        ]
-
+        # Skip traders polled within the last 25 seconds
+        followed = [t for t in followed if not was_recently_polled(t["proxy_wallet"], 25)]
         if not followed:
             return
 
         print(f"[POLL-ACTIVE] Checking {len(followed)} active traders...")
     else:
-        print(f"[POLL] Checking {len(followed)} followed traders...")
+        print(f"[POLL-NORMAL] Checking {len(followed)} followed traders...")
 
-    # Compute once per cycle — but we also re-check the kill switch before
-    # every single order to minimize the window where a panic-toggle is ignored.
-    live_trading = is_trading_enabled() and not dry_run
+    # Active mode: fetch balance and daily trade count for order execution
+    live_trading = False
+    account_balance = 0.0
+    daily_trades = 0
+    max_daily = MAX_DAILY_TRADES
 
-    # Fetch account balance for U-shaped sizing. If the fetch fails,
-    # balance stays 0 and no trades will be sized this cycle.
-    account_balance = client.get_own_balance()
-    if account_balance > 0:
-        print(f"[POLL] Account balance: ${account_balance:.2f}")
-    else:
-        print(f"[POLL] Balance fetch returned $0 — no trades will be sized this cycle")
+    if mode == "active":
+        live_trading = is_trading_enabled() and not dry_run
 
-    # Snapshot the daily trade count at the start of the cycle; increment
-    # locally as we place orders. We also re-check the DB value on every loop
-    # pass so that the cap is respected even across overlapping cycles.
-    try:
-        daily_trades = get_daily_trade_count()
-    except Exception as e:
-        print(f"[POLL] Could not fetch daily trade count: {e}")
-        daily_trades = 0
-    try:
-        max_daily = int(get_config("max_daily_trades") or MAX_DAILY_TRADES)
-    except (TypeError, ValueError):
-        max_daily = MAX_DAILY_TRADES
+        account_balance = client.get_own_balance()
+        if account_balance > 0:
+            print(f"[POLL-ACTIVE] Account balance: ${account_balance:.2f}")
+        else:
+            print(f"[POLL-ACTIVE] Balance $0 — no orders this cycle")
+
+        try:
+            daily_trades = get_daily_trade_count()
+        except Exception as e:
+            print(f"[POLL-ACTIVE] Could not fetch daily trade count: {e}")
+            daily_trades = 0
+        try:
+            max_daily = int(get_config("max_daily_trades") or MAX_DAILY_TRADES)
+        except (TypeError, ValueError):
+            max_daily = MAX_DAILY_TRADES
 
     for trader in followed:
         wallet = trader["proxy_wallet"]
@@ -641,15 +708,14 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
             partial_exits,
         ) = detect_new_positions(wallet, username)
 
-        # Record poll timestamp for dedup between normal/active polls
-        _last_polled_at[wallet] = datetime.now(timezone.utc)
+        # Record poll timestamp (thread-safe)
+        update_last_polled(wallet)
 
-        # Mark trader as active if any new entries or exits detected
+        # Mark trader as active if any changes detected (thread-safe)
         if new_entries or exits:
-            _active_traders[wallet] = datetime.now(timezone.utc)
+            add_active_trader(wallet)
 
-        # High-volume traders: track changes in DB but suppress real-time alerts
-        # AND skip live order placement — these are noise generators we don't mirror.
+        # High-volume traders: track in DB but suppress alerts and orders
         high_volume = api_position_count > REALTIME_ALERT_MAX_POSITIONS
         if high_volume:
             total_changes = (
@@ -657,12 +723,13 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 + len(partial_entries) + len(partial_exits)
             )
             if total_changes > 0:
-                print(f"[POLL] {username}: {total_changes} changes tracked silently (high-volume trader)")
+                print(f"[POLL] {username}: {total_changes} changes tracked silently (high-volume)")
             continue
 
         # ===== NEW ENTRIES =====
         if new_entries:
-            print(f"[POLL] {username}: {len(new_entries)} new entry(s) detected!")
+            label = "POLL-ACTIVE" if mode == "active" else "POLL-NORMAL"
+            print(f"[{label}] {username}: {len(new_entries)} new entry(s) detected!")
 
             entry_lines = []
             for pos in new_entries:
@@ -677,24 +744,15 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
 
                 size_usd = calculate_trade_size(account_balance, entry_price)
 
-                if size_usd <= 0:
-                    print(f"[POLL] Trade size too small, skipping '{title}'")
-                    continue
+                status = "DETECTED"
 
-                print(f"[POLL] U-size: ${size_usd:.2f} (balance=${account_balance:.0f}, price={entry_price:.2f})")
-
-                status = "ALERT ONLY"
-                order_result = None
-
-                if live_trading and token_id and size_usd > 0:
+                # Only the active poller places BUY orders
+                if mode == "active" and live_trading and token_id and size_usd > 0:
                     idem_key = make_idempotency_key(wallet, token_id)
 
-                    # Idempotency: skip if we've already placed an OPEN copy
-                    # trade for this (trader, token) pair.
                     if has_pending_copy_trade(idem_key):
-                        print(f"[POLL] {username}: already have open copy_trade for {token_id[:16]}..., skipping")
+                        print(f"[POLL-ACTIVE] {username}: already have open copy_trade for {token_id[:16]}..., skipping")
                         status = "DUPLICATE"
-                    # Pre-flight: re-check kill switch right before placing
                     elif not is_trading_enabled():
                         status = "KILL SWITCH"
                     elif daily_trades >= max_daily:
@@ -702,14 +760,16 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                             "reason": f"Daily trade limit reached ({daily_trades}/{max_daily})",
                         })
                         status = "CIRCUIT BREAKER"
+                    elif account_balance < MIN_ORDER_SIZE:
+                        print(f"[POLL-ACTIVE] Balance exhausted (${account_balance:.2f}), stopping orders")
+                        status = "NO BALANCE"
                     else:
-                        # Spread check
                         spread_ok, spread_pct = check_spread(token_id)
                         if not spread_ok:
-                            print(f"[POLL] {username}: spread too wide ({spread_pct:.1%}) on '{title}', skipping")
+                            print(f"[POLL-ACTIVE] {username}: spread too wide ({spread_pct:.1%}) on '{title}', skipping")
                             status = f"SKIP (spread {spread_pct:.1%})"
                         else:
-                            # BUY: `amount` is USD notional to spend.
+                            print(f"[POLL-ACTIVE] U-size: ${size_usd:.2f} (balance=${account_balance:.0f}, price={entry_price:.2f})")
                             order_result = place_copy_order(
                                 token_id=token_id,
                                 side="BUY",
@@ -717,7 +777,15 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                 title=title,
                             )
                             if is_order_filled(order_result):
-                                shares = size_usd / entry_price if entry_price > 0 else 0
+                                # Extract real fill data (C1 fix)
+                                actual_shares = extract_fill_shares(order_result)
+                                actual_price = extract_fill_price(order_result)
+                                if actual_shares <= 0:
+                                    print(f"[ORDER] WARNING: Using estimated shares (extraction failed)")
+                                    actual_shares = size_usd / entry_price if entry_price > 0 else 0
+                                if actual_price <= 0:
+                                    actual_price = entry_price
+
                                 try:
                                     log_copy_trade({
                                         "source_wallet": wallet,
@@ -728,24 +796,20 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                         "market_slug": pos.get("slug", ""),
                                         "outcome": outcome,
                                         "side": "BUY",
-                                        "entry_price": entry_price,
+                                        "entry_price": actual_price,
                                         "size_usd": size_usd,
-                                        "shares": shares,
+                                        "shares": actual_shares,
                                         "order_id": str(order_result.get("orderID", "") or order_result.get("orderId", "")),
                                         "idempotency_key": idem_key,
                                     })
                                     daily_trades += 1
+                                    account_balance -= size_usd  # Running balance (H2 fix)
                                     status = "EXECUTED"
                                 except psycopg2.errors.UniqueViolation:
-                                    # Partial unique index collision: another
-                                    # concurrent poll already logged an OPEN
-                                    # row for this (trader, token). The order
-                                    # we just sent is a real duplicate on-chain
-                                    # — log loudly so it gets reconciled.
                                     print(
-                                        f"[POLL] {username}: DUPLICATE ORDER WARNING - "
+                                        f"[POLL-ACTIVE] {username}: DUPLICATE ORDER WARNING - "
                                         f"UniqueViolation on idem_key {idem_key}. "
-                                        f"Real order was placed on-chain but another poll beat us to the ledger. "
+                                        f"Order placed on-chain but another poll beat us. "
                                         f"Manual reconciliation required for '{title}'."
                                     )
                                     send_alert("DUPLICATE_ORDER", {
@@ -756,7 +820,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                     })
                                     status = "DUPLICATE"
                             else:
-                                print(f"[POLL] {username}: order not filled on '{title}' (FOK killed or rejected)")
+                                print(f"[POLL-ACTIVE] {username}: order not filled on '{title}' (FOK killed)")
                                 status = "NOT FILLED"
 
                 entry_lines.append(
@@ -769,11 +833,11 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 "entries": "\n".join(entry_lines),
                 "live_trading": live_trading,
             })
-            print(f"[POLL] {username}: entry alert sent")
 
         # ===== FULL EXITS =====
         if exits:
-            print(f"[POLL] {username}: {len(exits)} exit(s) detected!")
+            label = "POLL-ACTIVE" if mode == "active" else "POLL-NORMAL"
+            print(f"[{label}] {username}: {len(exits)} exit(s) detected!")
 
             exit_lines = []
             for pos in exits:
@@ -782,8 +846,10 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 pre_existing = pos.get("pre_existing", False)
                 token_id = pos.get("asset_id", "")
 
-                exit_status = "ALERT ONLY"
-                if live_trading and not pre_existing and token_id:
+                exit_status = "DETECTED"
+
+                # Only the active poller places SELL orders
+                if mode == "active" and live_trading and not pre_existing and token_id:
                     our_trade = get_copy_trade_for_token(wallet, token_id)
                     if our_trade and our_trade.get("status") == "OPEN":
                         try:
@@ -791,34 +857,35 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                         except (TypeError, ValueError):
                             raw_shares = 0.0
 
-                        # SELL path: round DOWN so we never request more shares
-                        # than we actually hold.
                         shares_to_sell = round_to_tick(raw_shares, LOT_SIZE)
 
                         if shares_to_sell <= 0:
-                            # Dust residue (e.g. we hold 0.007 shares). Mark
-                            # the trade CLOSED anyway so the row doesn't
-                            # live forever and block future re-entries on
-                            # the same (trader, token) pair.
-                            update_copy_trade_status(our_trade["id"], "CLOSED")
+                            update_copy_trade_exit(our_trade["id"], "CLOSED", None)
                             exit_status = "DUST CLOSED"
-                            print(f"[POLL] {username}: residual {raw_shares} shares below lot, marking CLOSED")
+                            print(f"[POLL-ACTIVE] {username}: residual {raw_shares} shares below lot, marking CLOSED")
                         elif not is_trading_enabled():
                             exit_status = "KILL SWITCH"
                         else:
-                            # SELL: `amount` is number of shares, NOT USD.
                             sell_result = place_exit_order(
                                 token_id=token_id,
                                 shares=shares_to_sell,
                                 title=title,
                             )
                             if is_order_filled(sell_result):
-                                update_copy_trade_status(our_trade["id"], "CLOSED")
+                                exit_price = extract_fill_price(sell_result)
+                                update_copy_trade_exit(our_trade["id"], "CLOSED", exit_price if exit_price > 0 else None)
+                                account_balance += (exit_price * shares_to_sell) if exit_price > 0 else 0
                                 exit_status = f"SOLD {shares_to_sell:.2f}"
-                                print(f"[POLL] {username}: sold {shares_to_sell:.2f} shares of '{title}'")
+                                if exit_price > 0:
+                                    entry_p = float(our_trade.get("entry_price", 0) or 0)
+                                    pnl = (exit_price - entry_p) * shares_to_sell if entry_p > 0 else 0
+                                    print(f"[POLL-ACTIVE] {username}: sold {shares_to_sell:.2f} of '{title}' PnL=${pnl:+.2f}")
+                                else:
+                                    print(f"[POLL-ACTIVE] {username}: sold {shares_to_sell:.2f} of '{title}'")
                             else:
-                                print(f"[POLL] {username}: SELL not filled on '{title}' (FOK killed)")
-                                exit_status = "SELL FAILED"
+                                # C4 fix: don't mark closed — reconciliation will retry
+                                print(f"[POLL-ACTIVE] {username}: SELL not filled on '{title}' (FOK killed) — reconciliation will retry")
+                                exit_status = "SELL FAILED (will retry)"
                     else:
                         exit_status = "NO COPY TRADE"
 
@@ -831,13 +898,8 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 "count": len(exits),
                 "exits": "\n".join(exit_lines),
             })
-            print(f"[POLL] {username}: exit alert sent")
 
-        # ===== PARTIAL EXITS =====
-        # A followed trader reduced an existing position by >threshold. We do
-        # NOT auto-sell on partials by default — only alert. Sizing the partial
-        # mirror correctly against our copy cost basis is a harder problem and
-        # needs its own review before going live.
+        # ===== PARTIAL EXITS (alert only, no auto-sell) =====
         if partial_exits:
             for pe in partial_exits:
                 details = (
@@ -851,7 +913,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                     **pe,
                 })
 
-        # ===== PARTIAL ENTRIES =====
+        # ===== PARTIAL ENTRIES (alert only) =====
         if partial_entries:
             for pe in partial_entries:
                 details = (
@@ -865,8 +927,143 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                     **pe,
                 })
 
-    label = "POLL-ACTIVE" if mode == "active" else "POLL"
+    label = "POLL-ACTIVE" if mode == "active" else "POLL-NORMAL"
     print(f"[{label}] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
+
+
+# ============================================================
+# Reconciliation job (C4 fix — catches orphaned positions)
+# ============================================================
+
+def run_reconciliation(dry_run: bool = True):
+    """
+    Cross-reference open copy_trades against followed_positions.
+    If the source trader exited but we still hold, place SELL.
+    Runs every 5 minutes. Failed sells are retried on the next cycle.
+    """
+    orphans = get_orphaned_copy_trades()
+
+    if not orphans:
+        return
+
+    print(f"[RECONCILE] Found {len(orphans)} orphaned position(s)")
+
+    if dry_run or not is_trading_enabled():
+        for orphan in orphans:
+            print(f"[RECONCILE] Would sell: {orphan['market_title']} — {orphan['shares']} shares (dry run)")
+        return
+
+    for orphan in orphans:
+        token_id = orphan["token_id"]
+        trade_id = orphan["id"]
+
+        try:
+            raw_shares = float(orphan.get("shares", 0) or 0)
+        except (TypeError, ValueError):
+            raw_shares = 0.0
+
+        shares_to_sell = round_to_tick(raw_shares, LOT_SIZE)
+
+        if shares_to_sell <= 0:
+            print(f"[RECONCILE] No shares to sell for trade {trade_id}, marking closed")
+            update_copy_trade_exit(trade_id, "CLOSED", None)
+            continue
+
+        # Re-check kill switch before each sell
+        if not is_trading_enabled():
+            print(f"[RECONCILE] Kill switch OFF, stopping reconciliation")
+            return
+
+        print(f"[RECONCILE] Selling {shares_to_sell:.2f} shares of '{orphan['market_title']}'")
+
+        sell_result = place_copy_order(
+            token_id=token_id,
+            side="SELL",
+            amount=shares_to_sell,
+            title=orphan.get("market_title", ""),
+        )
+
+        if is_order_filled(sell_result):
+            exit_price = extract_fill_price(sell_result)
+            update_copy_trade_exit(trade_id, "CLOSED", exit_price if exit_price > 0 else None)
+            if exit_price > 0:
+                entry_p = float(orphan.get("entry_price", 0) or 0)
+                pnl = (exit_price - entry_p) * shares_to_sell if entry_p > 0 else 0
+                print(f"[RECONCILE] Sold — exit price: {exit_price:.4f}, PnL: ${pnl:+.2f}")
+            else:
+                print(f"[RECONCILE] Sold successfully (exit price unknown)")
+        else:
+            # Leave OPEN — next reconciliation cycle retries
+            print(f"[RECONCILE] Sell failed for trade {trade_id} — will retry next cycle")
+
+    print(f"[RECONCILE] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
+
+
+# ============================================================
+# Test order function (H4 — discover real CLOB response schema)
+# ============================================================
+
+def test_live_order():
+    """
+    Place a $1 test order and print the FULL response.
+    Run ONCE manually to discover field names before going live.
+
+    Usage:
+      python -c "from copy_trader import test_live_order; test_live_order()"
+    """
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY
+
+    clob = get_clob_client()
+    if not clob:
+        print("ERROR: Could not initialize CLOB client")
+        return None
+
+    # PASTE A REAL TOKEN ID HERE before running.
+    # Find one at: https://gamma-api.polymarket.com/markets?closed=false&limit=5
+    # Use a clobTokenIds value from a liquid market.
+    TEST_TOKEN_ID = "PASTE_A_REAL_TOKEN_ID_HERE"
+
+    if "PASTE" in TEST_TOKEN_ID:
+        print("ERROR: Replace TEST_TOKEN_ID with a real token ID first!")
+        print("  Find one at: https://gamma-api.polymarket.com/markets?closed=false&limit=5")
+        return None
+
+    print("=" * 60)
+    print("TEST: Placing $1 FOK BUY order")
+    print(f"Token: {TEST_TOKEN_ID[:40]}...")
+    print("=" * 60)
+
+    try:
+        mo = MarketOrderArgs(
+            token_id=TEST_TOKEN_ID,
+            amount=1.0,
+            side=BUY,
+        )
+        signed_order = clob.create_market_order(mo)
+        result = clob.post_order(signed_order, OrderType.FOK)
+
+        print(f"\nResponse type: {type(result)}")
+        print(f"Raw response: {result}")
+
+        if isinstance(result, dict):
+            print("\nField breakdown:")
+            for key, value in result.items():
+                print(f"  {key}: {value} (type: {type(value).__name__})")
+
+        print("\n" + "=" * 60)
+        print("UPDATE THESE FUNCTIONS with the real field names above:")
+        print("  - extract_fill_shares()")
+        print("  - extract_fill_price()")
+        print("  - is_order_filled()")
+        print("=" * 60)
+
+        return result
+    except Exception as e:
+        print(f"\nOrder FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 # ============================================================
@@ -891,5 +1088,9 @@ if __name__ == "__main__":
             print("Aborted.")
             sys.exit(0)
 
-    # Single poll for testing; the scheduler wraps this
-    poll_followed_traders(dry_run=dry_run)
+    if "--test-order" in sys.argv:
+        test_live_order()
+    elif "--reconcile" in sys.argv:
+        run_reconciliation(dry_run=dry_run)
+    else:
+        poll_followed_traders(dry_run=dry_run, mode="normal")
