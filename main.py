@@ -145,10 +145,6 @@ def main():
     if "--live" in sys.argv:
         DRY_RUN = False
         print("WARNING: LIVE MODE — real orders will be placed!")
-        confirm = input("Type 'CONFIRM' to proceed: ")
-        if confirm != "CONFIRM":
-            print("Aborted.")
-            sys.exit(0)
 
     # Initialize database
     print("[MAIN] Initializing database...")

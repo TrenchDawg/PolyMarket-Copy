@@ -994,15 +994,21 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
     # Runs globally — not limited to the per-trader loop above — so
     # that flags survive even if the trader was pruned from _active_traders.
     # ==================================================================
+    if mode == "active":
+        print(f"[DIAG] needs_order gate: mode=active live_trading={live_trading} dry_run={dry_run} kill_switch_enabled={is_trading_enabled()}")
     if mode == "active" and live_trading:
         # ----- Process needs_order flags (BUY orders) -----
         all_followed = {t["proxy_wallet"]: t for t in get_followed_traders()}
-        for pending_wallet in get_all_wallets_needing_orders():
+        pending_wallets = get_all_wallets_needing_orders()
+        print(f"[DIAG] Found {len(pending_wallets)} wallets with needs_order flags: {pending_wallets}")
+        for pending_wallet in pending_wallets:
             trader_info = all_followed.get(pending_wallet)
             if not trader_info:
+                print(f"[DIAG] Skipping {pending_wallet}: not in followed traders")
                 continue
             pending_username = trader_info.get("username", pending_wallet[:10])
             pending_positions = get_positions_needing_orders(pending_wallet)
+            print(f"[DIAG] Processing needs_order flags for {pending_username} ({pending_wallet}): {len(pending_positions)} positions")
 
             for fp in pending_positions:
                 fp_id = fp["id"]
@@ -1012,12 +1018,16 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 condition_id = fp.get("condition_id", "")
                 attempts = int(fp.get("needs_order_attempts", 0) or 0)
 
+                print(f"[DIAG] fp_id={fp_id} title='{title}' outcome={outcome} token_id={token_id[:20] if token_id else 'EMPTY'} attempts={attempts}")
+
                 if not token_id:
+                    print(f"[DIAG] Skipping fp_id={fp_id}: no token_id, clearing flag")
                     clear_needs_order(fp_id)
                     continue
 
                 # Give up after MAX_NEEDS_ORDER_ATTEMPTS failures
                 if attempts >= MAX_NEEDS_ORDER_ATTEMPTS:
+                    print(f"[DIAG] Skipping fp_id={fp_id}: max attempts ({attempts}) exceeded")
                     clear_needs_order(fp_id)
                     print(f"[POLL-ACTIVE] {pending_username}: giving up on '{title}' after {attempts} failed attempts")
                     send_alert("ORDER_FAILED_PERMANENT", {
@@ -1031,38 +1041,46 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 # Pre-flight checks
                 idem_key = make_idempotency_key(pending_wallet, token_id)
                 if has_pending_copy_trade(idem_key):
+                    print(f"[DIAG] Skipping fp_id={fp_id}: has PENDING/OPEN copy_trade for idem_key={idem_key}")
                     clear_needs_order(fp_id)
                     print(f"[POLL-ACTIVE] {pending_username}: already have OPEN/PENDING copy_trade for '{title}', clearing flag")
                     continue
 
+                print(f"[DIAG] Checking kill switch: enabled={is_trading_enabled()}")
                 if not is_trading_enabled():
                     print(f"[POLL-ACTIVE] Kill switch OFF, skipping needs_order processing")
                     break
 
+                print(f"[DIAG] Checking daily_trades: {daily_trades}/{max_daily}")
                 if daily_trades >= max_daily:
+                    print(f"[DIAG] Skipping: daily trade limit hit")
                     send_alert("CIRCUIT_BREAKER", {
                         "reason": f"Daily trade limit reached ({daily_trades}/{max_daily})",
                     })
                     break
 
+                print(f"[DIAG] Checking balance: ${account_balance:.2f} vs MIN_ORDER_SIZE ${MIN_ORDER_SIZE}")
                 if account_balance < MIN_ORDER_SIZE:
                     print(f"[POLL-ACTIVE] Balance exhausted (${account_balance:.2f}), stopping needs_order processing")
                     break
 
                 # Fetch price and check spread
                 spread_ok, spread_pct = check_spread(token_id)
+                print(f"[DIAG] Spread check: ok={spread_ok} pct={spread_pct:.4f}")
                 if not spread_ok:
                     increment_needs_order_attempts(fp_id)
                     print(f"[POLL-ACTIVE] {pending_username}: spread too wide ({spread_pct:.1%}) on '{title}', will retry (attempt {attempts+1})")
                     continue
 
                 order_price = get_order_price(token_id, side="buy")
+                print(f"[DIAG] Order price: {order_price}")
                 if order_price <= 0:
                     increment_needs_order_attempts(fp_id)
                     print(f"[POLL-ACTIVE] {pending_username}: no price for '{title}', will retry (attempt {attempts+1})")
                     continue
 
                 size_usd = calculate_trade_size(account_balance, order_price)
+                print(f"[DIAG] size_usd={size_usd:.2f}")
                 if size_usd <= 0:
                     clear_needs_order(fp_id)
                     print(f"[POLL-ACTIVE] {pending_username}: calculated size $0 for '{title}', clearing flag")
@@ -1094,14 +1112,24 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                     continue
 
                 if pending_id:
-                    order_result = place_copy_order(
-                        token_id=token_id,
-                        side="BUY",
-                        size=buy_size,
-                        price=order_price,
-                        tick_size=mkt_tick,
-                        neg_risk=mkt_neg,
-                    )
+                    print(f"[DIAG] About to call place_copy_order for fp_id={fp_id} token={token_id[:20]} size={buy_size} price={order_price} tick={mkt_tick} neg_risk={mkt_neg}")
+                    try:
+                        order_result = place_copy_order(
+                            token_id=token_id,
+                            side="BUY",
+                            size=buy_size,
+                            price=order_price,
+                            tick_size=mkt_tick,
+                            neg_risk=mkt_neg,
+                        )
+                        print(f"[DIAG] place_copy_order returned: {order_result}")
+                    except Exception as e:
+                        print(f"[DIAG] place_copy_order raised exception: {type(e).__name__}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        update_pending_to_failed(pending_id)
+                        increment_needs_order_attempts(fp_id)
+                        continue
                     if is_order_filled(order_result):
                         actual_shares = extract_fill_shares(order_result)
                         actual_price = extract_fill_price(order_result)
