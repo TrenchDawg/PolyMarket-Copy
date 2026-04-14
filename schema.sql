@@ -200,6 +200,39 @@ BEGIN
     END IF;
 END $$;
 
+-- Migration: add needs_order flag and retry counter to followed_positions
+-- The normal poller sets needs_order = TRUE when a new entry is detected.
+-- The active poller consumes it, places the order, then clears the flag.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'followed_positions' AND column_name = 'needs_order') THEN
+        ALTER TABLE followed_positions ADD COLUMN needs_order BOOLEAN DEFAULT FALSE;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'followed_positions' AND column_name = 'needs_order_attempts') THEN
+        ALTER TABLE followed_positions ADD COLUMN needs_order_attempts INTEGER DEFAULT 0;
+    END IF;
+END $$;
+
+-- Migration: add needs_sell flag to copy_trades
+-- The normal poller sets needs_sell = TRUE when a followed trader exits.
+-- The active poller consumes it, places the sell, then clears the flag.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'copy_trades' AND column_name = 'needs_sell') THEN
+        ALTER TABLE copy_trades ADD COLUMN needs_sell BOOLEAN DEFAULT FALSE;
+    END IF;
+END $$;
+
+-- Partial indexes for flag-driven order processing (queried every 30s by active poller)
+CREATE INDEX IF NOT EXISTS idx_followed_positions_needs_order
+    ON followed_positions(proxy_wallet) WHERE needs_order = TRUE AND status = 'OPEN';
+
+CREATE INDEX IF NOT EXISTS idx_copy_trades_needs_sell
+    ON copy_trades(id) WHERE needs_sell = TRUE AND status = 'OPEN';
+
 -- ============================================================
 -- SYSTEM_CONFIG: Runtime configuration (kill switch, etc.)
 -- ============================================================

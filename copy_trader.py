@@ -53,7 +53,18 @@ from db import (
     get_daily_realized_pnl,
     get_conn,
     release_conn,
+    set_needs_order_for_new_entries,
+    get_positions_needing_orders,
+    get_all_wallets_needing_orders,
+    clear_needs_order,
+    increment_needs_order_attempts,
+    get_trades_needing_sell,
+    clear_needs_sell,
+    set_needs_sell,
 )
+
+
+MAX_NEEDS_ORDER_ATTEMPTS = 3  # Clear needs_order after this many failed BUY attempts
 
 
 # ============================================================
@@ -371,6 +382,10 @@ def detect_new_positions(wallet: str, username: str = "") -> tuple:
       - api_position_count: total number of open positions in the API response
       - partial_entries: positions the trader added to by >PARTIAL_SIZE_CHANGE_THRESHOLD
       - partial_exits: positions the trader reduced by >PARTIAL_SIZE_CHANGE_THRESHOLD
+
+    New entries are saved with needs_order=FALSE. The caller is responsible for
+    setting needs_order=TRUE via set_needs_order_for_new_entries() after checking
+    whether the trader is high-volume (>REALTIME_ALERT_MAX_POSITIONS).
     """
     # Get current positions from API. size_threshold=0 so dust positions
     # stay visible and don't trigger false exits when sizes drift near the cut.
@@ -641,6 +656,11 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
     if mode == "active":
         prune_stale_active_traders(ACTIVE_TRADER_WINDOW_MINUTES)
 
+        # Rehydrate: ensure wallets with pending DB flags are in the active set,
+        # even after a process restart or if they were pruned from _active_traders.
+        for pending_wallet in get_all_wallets_needing_orders():
+            add_active_trader(pending_wallet)
+
         active_snapshot = get_active_traders_snapshot()
         if not active_snapshot:
             return  # no active traders — skip entirely
@@ -727,6 +747,26 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
             if total_changes > 0:
                 print(f"[POLL] {username}: {total_changes} changes tracked silently (high-volume)")
             continue
+
+        # Normal poller: set needs_order flag for new entries so the active
+        # poller can pick them up. This is a no-op if new_entries is empty.
+        if mode == "normal" and new_entries:
+            new_asset_ids = [p.get("asset", "") for p in new_entries if p.get("asset")]
+            set_needs_order_for_new_entries(wallet, new_asset_ids)
+
+        # Normal poller: set needs_sell flag on our OPEN copy_trades when
+        # the source trader exits, so the active poller can place SELL orders.
+        if mode == "normal" and exits:
+            for ex_pos in exits:
+                ex_token = ex_pos.get("asset_id", "")
+                if not ex_token:
+                    continue
+                if ex_pos.get("pre_existing", False):
+                    continue
+                our_trade = get_copy_trade_for_token(wallet, ex_token)
+                if our_trade and our_trade.get("status") == "OPEN":
+                    set_needs_sell(our_trade["id"])
+                    print(f"[POLL-NORMAL] {username}: flagged needs_sell on copy_trade {our_trade['id']} for '{ex_pos.get('title', '?')}'")
 
         # ===== NEW ENTRIES =====
         if new_entries:
@@ -946,6 +986,198 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                     "details": details,
                     **pe,
                 })
+
+    # ==================================================================
+    # Flag-driven order processing (active poller only)
+    # Runs AFTER the per-trader detection loop so we process flags set
+    # by the normal poller (or by this cycle's own detection).
+    # Runs globally — not limited to the per-trader loop above — so
+    # that flags survive even if the trader was pruned from _active_traders.
+    # ==================================================================
+    if mode == "active" and live_trading:
+        # ----- Process needs_order flags (BUY orders) -----
+        all_followed = {t["proxy_wallet"]: t for t in get_followed_traders()}
+        for pending_wallet in get_all_wallets_needing_orders():
+            trader_info = all_followed.get(pending_wallet)
+            if not trader_info:
+                continue
+            pending_username = trader_info.get("username", pending_wallet[:10])
+            pending_positions = get_positions_needing_orders(pending_wallet)
+
+            for fp in pending_positions:
+                fp_id = fp["id"]
+                token_id = fp.get("asset_id", "")
+                title = fp.get("title", "unknown")
+                outcome = fp.get("outcome", "?")
+                condition_id = fp.get("condition_id", "")
+                attempts = int(fp.get("needs_order_attempts", 0) or 0)
+
+                if not token_id:
+                    clear_needs_order(fp_id)
+                    continue
+
+                # Give up after MAX_NEEDS_ORDER_ATTEMPTS failures
+                if attempts >= MAX_NEEDS_ORDER_ATTEMPTS:
+                    clear_needs_order(fp_id)
+                    print(f"[POLL-ACTIVE] {pending_username}: giving up on '{title}' after {attempts} failed attempts")
+                    send_alert("ORDER_FAILED_PERMANENT", {
+                        "source_username": pending_username,
+                        "title": title,
+                        "outcome": outcome,
+                        "attempts": attempts,
+                    })
+                    continue
+
+                # Pre-flight checks
+                idem_key = make_idempotency_key(pending_wallet, token_id)
+                if has_pending_copy_trade(idem_key):
+                    clear_needs_order(fp_id)
+                    print(f"[POLL-ACTIVE] {pending_username}: already have OPEN/PENDING copy_trade for '{title}', clearing flag")
+                    continue
+
+                if not is_trading_enabled():
+                    print(f"[POLL-ACTIVE] Kill switch OFF, skipping needs_order processing")
+                    break
+
+                if daily_trades >= max_daily:
+                    send_alert("CIRCUIT_BREAKER", {
+                        "reason": f"Daily trade limit reached ({daily_trades}/{max_daily})",
+                    })
+                    break
+
+                if account_balance < MIN_ORDER_SIZE:
+                    print(f"[POLL-ACTIVE] Balance exhausted (${account_balance:.2f}), stopping needs_order processing")
+                    break
+
+                # Fetch price and check spread
+                spread_ok, spread_pct = check_spread(token_id)
+                if not spread_ok:
+                    increment_needs_order_attempts(fp_id)
+                    print(f"[POLL-ACTIVE] {pending_username}: spread too wide ({spread_pct:.1%}) on '{title}', will retry (attempt {attempts+1})")
+                    continue
+
+                order_price = get_order_price(token_id, side="buy")
+                if order_price <= 0:
+                    increment_needs_order_attempts(fp_id)
+                    print(f"[POLL-ACTIVE] {pending_username}: no price for '{title}', will retry (attempt {attempts+1})")
+                    continue
+
+                size_usd = calculate_trade_size(account_balance, order_price)
+                if size_usd <= 0:
+                    clear_needs_order(fp_id)
+                    print(f"[POLL-ACTIVE] {pending_username}: calculated size $0 for '{title}', clearing flag")
+                    continue
+
+                buy_size = round_to_tick(size_usd / order_price, LOT_SIZE)
+                mkt_tick, mkt_neg = get_token_market_params(condition_id)
+
+                print(f"[POLL-ACTIVE] {pending_username}: placing BUY for '{title}' — ${size_usd:.2f} ({buy_size:.2f} shares @ {order_price:.2f})")
+
+                # Write PENDING record BEFORE placing order (crash safety)
+                pending_id = None
+                try:
+                    pending_id = log_pending_copy_trade({
+                        "source_wallet": pending_wallet,
+                        "source_username": pending_username,
+                        "condition_id": condition_id,
+                        "token_id": token_id,
+                        "market_title": title,
+                        "market_slug": fp.get("slug", ""),
+                        "outcome": outcome,
+                        "side": "BUY",
+                        "size_usd": size_usd,
+                        "idempotency_key": idem_key,
+                    })
+                except psycopg2.errors.UniqueViolation:
+                    clear_needs_order(fp_id)
+                    print(f"[POLL-ACTIVE] {pending_username}: DUPLICATE — PENDING/OPEN record already exists for {idem_key}")
+                    continue
+
+                if pending_id:
+                    order_result = place_copy_order(
+                        token_id=token_id,
+                        side="BUY",
+                        size=buy_size,
+                        price=order_price,
+                        tick_size=mkt_tick,
+                        neg_risk=mkt_neg,
+                    )
+                    if is_order_filled(order_result):
+                        actual_shares = extract_fill_shares(order_result)
+                        actual_price = extract_fill_price(order_result)
+                        if actual_shares <= 0:
+                            actual_shares = size_usd / order_price if order_price > 0 else 0
+                        if actual_price <= 0:
+                            actual_price = order_price
+                        order_id = str(order_result.get("orderID", "") or order_result.get("orderId", ""))
+                        update_pending_to_open(pending_id, order_id, actual_price, actual_shares)
+                        daily_trades += 1
+                        account_balance -= size_usd
+                        clear_needs_order(fp_id)
+                        print(f"[POLL-ACTIVE] {pending_username}: EXECUTED BUY on '{title}' — {actual_shares:.2f} shares @ {actual_price:.4f}")
+                    else:
+                        update_pending_to_failed(pending_id)
+                        increment_needs_order_attempts(fp_id)
+                        print(f"[POLL-ACTIVE] {pending_username}: BUY not filled on '{title}' (attempt {attempts+1}/{MAX_NEEDS_ORDER_ATTEMPTS})")
+
+        # ----- Process needs_sell flags (SELL orders) -----
+        pending_sells = get_trades_needing_sell()
+        for trade in pending_sells:
+            trade_id = trade["id"]
+            token_id = trade.get("token_id", "")
+            title = trade.get("market_title", "unknown")
+            sell_username = trade.get("source_username", "?")
+
+            if not token_id:
+                clear_needs_sell(trade_id)
+                continue
+
+            if not is_trading_enabled():
+                print(f"[POLL-ACTIVE] Kill switch OFF, skipping needs_sell processing")
+                break
+
+            try:
+                raw_shares = float(trade.get("shares", 0) or 0)
+            except (TypeError, ValueError):
+                raw_shares = 0.0
+
+            shares_to_sell = round_to_tick(raw_shares, LOT_SIZE)
+
+            if shares_to_sell <= 0:
+                update_copy_trade_exit(trade_id, "CLOSED", None)
+                clear_needs_sell(trade_id)
+                print(f"[POLL-ACTIVE] {sell_username}: dust position on '{title}', marking CLOSED")
+                continue
+
+            sell_price = get_order_price(token_id, side="sell")
+            if sell_price <= 0:
+                # Don't clear — reconciliation will retry
+                print(f"[POLL-ACTIVE] {sell_username}: no sell price for '{title}', will retry")
+                continue
+
+            sell_tick, sell_neg = get_token_market_params(trade.get("condition_id", ""))
+            sell_result = place_copy_order(
+                token_id=token_id,
+                side="SELL",
+                size=shares_to_sell,
+                price=sell_price,
+                tick_size=sell_tick,
+                neg_risk=sell_neg,
+            )
+
+            if is_order_filled(sell_result):
+                exit_price = extract_fill_price(sell_result)
+                update_copy_trade_exit(trade_id, "CLOSED", exit_price if exit_price > 0 else None)
+                clear_needs_sell(trade_id)
+                if exit_price > 0:
+                    entry_p = float(trade.get("entry_price", 0) or 0)
+                    pnl = (exit_price - entry_p) * shares_to_sell if entry_p > 0 else 0
+                    print(f"[POLL-ACTIVE] {sell_username}: SOLD {shares_to_sell:.2f} of '{title}' PnL=${pnl:+.2f}")
+                else:
+                    print(f"[POLL-ACTIVE] {sell_username}: SOLD {shares_to_sell:.2f} of '{title}'")
+            else:
+                # Don't clear — reconciliation will retry on next cycle
+                print(f"[POLL-ACTIVE] {sell_username}: SELL not filled on '{title}', will retry")
 
     label = "POLL-ACTIVE" if mode == "active" else "POLL-NORMAL"
     print(f"[{label}] Cycle complete at {datetime.now(timezone.utc).isoformat()}")

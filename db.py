@@ -594,7 +594,14 @@ def upsert_followed_position(position: dict):
     `size_at_last_poll` tracks the size we observed in the *previous* poll so
     the next poll can detect partial entries/exits. On every upsert we set it
     to the current size so the next poll's comparison is well-defined.
+
+    `needs_order` is set on INSERT (for new entries) but the ON CONFLICT UPDATE
+    deliberately preserves the existing value. This prevents the active poller
+    (or a concurrent normal poll) from accidentally clearing a flag that the
+    normal poller set. Only clear_needs_order() should reset this flag.
     """
+    position = dict(position)
+    position.setdefault("needs_order", False)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -603,21 +610,28 @@ def upsert_followed_position(position: dict):
                     proxy_wallet, asset_id, condition_id, title, slug,
                     outcome, outcome_index, size, size_at_last_poll,
                     avg_price, entry_price,
-                    current_price, current_value, pre_existing, status, last_updated
+                    current_price, current_value, pre_existing,
+                    needs_order, needs_order_attempts,
+                    status, last_updated
                 ) VALUES (
                     %(proxy_wallet)s, %(asset_id)s, %(condition_id)s, %(title)s, %(slug)s,
                     %(outcome)s, %(outcome_index)s, %(size)s, %(size)s,
                     %(avg_price)s, %(entry_price)s,
-                    %(current_price)s, %(current_value)s, %(pre_existing)s, 'OPEN', NOW()
+                    %(current_price)s, %(current_value)s, %(pre_existing)s,
+                    %(needs_order)s, 0,
+                    'OPEN', NOW()
                 )
                 ON CONFLICT (proxy_wallet, asset_id) DO UPDATE SET
                     current_price = EXCLUDED.current_price,
                     current_value = EXCLUDED.current_value,
                     size = EXCLUDED.size,
                     size_at_last_poll = EXCLUDED.size,
+                    pre_existing = EXCLUDED.pre_existing,
+                    needs_order_attempts = 0,
                     status = 'OPEN',
                     closed_at = NULL,
                     last_updated = NOW()
+                    -- needs_order intentionally NOT updated here; only clear_needs_order() resets it
             """, position)
         conn.commit()
     finally:
@@ -680,6 +694,128 @@ def get_daily_realized_pnl() -> float:
                   AND pnl IS NOT NULL
             """)
             return float(cur.fetchone()[0])
+    finally:
+        release_conn(conn)
+
+
+def set_needs_order_for_new_entries(wallet: str, asset_ids: list):
+    """Set needs_order = TRUE for specific positions (batch, after high_volume check)."""
+    if not asset_ids:
+        return
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE followed_positions
+                SET needs_order = TRUE
+                WHERE proxy_wallet = %s
+                  AND asset_id = ANY(%s)
+                  AND status = 'OPEN'
+                  AND pre_existing = FALSE
+            """, (wallet, asset_ids))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def get_positions_needing_orders(wallet: str) -> list:
+    """Return followed_positions with needs_order = TRUE for a specific trader."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM followed_positions
+                WHERE proxy_wallet = %s AND needs_order = TRUE AND status = 'OPEN'
+            """, (wallet,))
+            return cur.fetchall()
+    finally:
+        release_conn(conn)
+
+
+def get_all_wallets_needing_orders() -> list:
+    """Return distinct wallets that have at least one needs_order = TRUE position."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT proxy_wallet FROM followed_positions
+                WHERE needs_order = TRUE AND status = 'OPEN'
+            """)
+            return [row[0] for row in cur.fetchall()]
+    finally:
+        release_conn(conn)
+
+
+def clear_needs_order(position_id: int):
+    """Clear the needs_order flag and reset retry counter after processing."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE followed_positions
+                SET needs_order = FALSE, needs_order_attempts = 0
+                WHERE id = %s
+            """, (position_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def increment_needs_order_attempts(position_id: int):
+    """Increment the retry counter for a needs_order position."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE followed_positions
+                SET needs_order_attempts = COALESCE(needs_order_attempts, 0) + 1
+                WHERE id = %s
+            """, (position_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def get_trades_needing_sell() -> list:
+    """Return copy_trades with needs_sell = TRUE (global, not wallet-scoped)."""
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT * FROM copy_trades
+                WHERE needs_sell = TRUE AND status = 'OPEN'
+            """)
+            return cur.fetchall()
+    finally:
+        release_conn(conn)
+
+
+def clear_needs_sell(trade_id: int):
+    """Clear the needs_sell flag after the active poller has processed it."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET needs_sell = FALSE
+                WHERE id = %s
+            """, (trade_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def set_needs_sell(trade_id: int):
+    """Set the needs_sell flag on a copy_trade when the source trader exits."""
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET needs_sell = TRUE
+                WHERE id = %s AND status = 'OPEN'
+            """, (trade_id,))
+        conn.commit()
     finally:
         release_conn(conn)
 
