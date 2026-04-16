@@ -627,11 +627,11 @@ def upsert_followed_position(position: dict):
                     size = EXCLUDED.size,
                     size_at_last_poll = EXCLUDED.size,
                     pre_existing = EXCLUDED.pre_existing,
-                    needs_order_attempts = 0,
                     status = 'OPEN',
                     closed_at = NULL,
                     last_updated = NOW()
-                    -- needs_order intentionally NOT updated here; only clear_needs_order() resets it
+                    -- needs_order and needs_order_attempts intentionally NOT updated here;
+                    -- only clear_needs_order() / increment_needs_order_attempts() touch these
             """, position)
         conn.commit()
     finally:
