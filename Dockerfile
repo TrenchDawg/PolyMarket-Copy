@@ -9,6 +9,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY . .
 
-# Default: dry run mode
-# Override with Railway env var: COMMAND=--live
-CMD ["sh", "-c", "python main.py ${COMMAND:-}"]
+# Live trading mode (change to "main.py" without --live for dry run)
+CMD ["python", "main.py", "--live"]
