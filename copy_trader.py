@@ -27,7 +27,8 @@ from config import (
     TRADE_SIZE_MAX_DISTANCE,
     TICK_SIZE,
     LOT_SIZE,
-    MIN_ORDER_SIZE,
+    MIN_ORDER_SHARES,
+    MIN_NOTIONAL_USD,
     REALTIME_ALERT_MAX_POSITIONS,
     ACTIVE_TRADER_WINDOW_MINUTES,
 )
@@ -113,7 +114,8 @@ def calculate_trade_size(account_balance: float, entry_price: float) -> float:
     size = max(size, floor)
     size = round_to_tick(size, LOT_SIZE)
 
-    if size < MIN_ORDER_SIZE:
+    shares = size / entry_price
+    if shares < MIN_ORDER_SHARES or size < MIN_NOTIONAL_USD:
         return 0.0
 
     return size
@@ -802,7 +804,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                             "reason": f"Daily trade limit reached ({daily_trades}/{max_daily})",
                         })
                         status = "CIRCUIT BREAKER"
-                    elif account_balance < MIN_ORDER_SIZE:
+                    elif account_balance < MIN_NOTIONAL_USD:
                         print(f"[POLL-ACTIVE] Balance exhausted (${account_balance:.2f}), stopping orders")
                         status = "NO BALANCE"
                     else:
@@ -1059,8 +1061,8 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                     })
                     break
 
-                print(f"[DIAG] Checking balance: ${account_balance:.2f} vs MIN_ORDER_SIZE ${MIN_ORDER_SIZE}")
-                if account_balance < MIN_ORDER_SIZE:
+                print(f"[DIAG] Checking balance: ${account_balance:.2f} vs MIN_NOTIONAL_USD ${MIN_NOTIONAL_USD}")
+                if account_balance < MIN_NOTIONAL_USD:
                     print(f"[POLL-ACTIVE] Balance exhausted (${account_balance:.2f}), stopping needs_order processing")
                     break
 
