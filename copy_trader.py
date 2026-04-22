@@ -38,6 +38,7 @@ from db import (
     log_pending_copy_trade,
     update_pending_to_open,
     update_pending_to_failed,
+    set_pending_order_id,
     is_trading_enabled,
     get_config,
     set_config,
@@ -134,16 +135,18 @@ def make_idempotency_key(source_wallet: str, asset_id: str) -> str:
 
 def is_order_filled(order_result) -> bool:
     """
-    Determine whether a CLOB order response represents a successful placement.
+    Determine whether a CLOB order response represents an IMMEDIATE FILL.
 
     Real CLOB response shape:
         {"success": True, "status": "live"|"matched"|"filled", "orderID": "0x...",
          "errorMsg": "", "takingAmount": "", "makingAmount": ""}
 
     - success must be True
-    - status "live" = limit order on the book (accepted, not yet matched)
-    - status "matched"/"filled" = immediately filled
-    - Any other status or success=False → not filled
+    - status "matched"/"filled" = immediately filled  -> True
+    - status "live" = limit order resting on the book, NOT a fill -> False.
+      Callers should check is_order_resting() to distinguish this from
+      outright failure (the order exists and may fill later; it is not dead).
+    - Any other status or success=False -> not filled
     """
     if not order_result:
         return False
@@ -157,11 +160,34 @@ def is_order_filled(order_result) -> bool:
         return False
 
     status = str(order_result.get("status", "")).lower()
-    if status in ("live", "matched", "filled"):
+    if status in ("matched", "filled"):
         return True
+
+    if status == "live":
+        # Resting limit order — accepted but no shares moved. See is_order_resting().
+        return False
 
     print(f"[ORDER] is_order_filled: unexpected status '{status}' in response: {order_result}")
     return False
+
+
+def is_order_resting(order_result) -> bool:
+    """
+    Return True when the CLOB accepted the order but it is sitting on the
+    book unfilled (status="live"). Distinct from both "filled" and "failed":
+    the order exists on-chain, holds capital, and may fill later.
+
+    Callers should leave the owning copy_trade in PENDING, record the
+    order_id, and let a resting-order poller (TODO below run_reconciliation)
+    later promote it to OPEN or cancel it.
+    """
+    if not order_result or not isinstance(order_result, dict):
+        return False
+    if order_result.get("success") is not True:
+        return False
+    if order_result.get("errorMsg"):
+        return False
+    return str(order_result.get("status", "")).lower() == "live"
 
 
 def extract_fill_shares(order_result: dict) -> float:
@@ -860,19 +886,41 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                         tick_size=mkt_tick,
                                         neg_risk=mkt_neg,
                                     )
+                                    order_id = (
+                                        str(order_result.get("orderID", "") or order_result.get("orderId", ""))
+                                        if isinstance(order_result, dict) else ""
+                                    )
                                     if is_order_filled(order_result):
                                         actual_shares = extract_fill_shares(order_result)
                                         actual_price = extract_fill_price(order_result)
-                                        if actual_shares <= 0:
-                                            print(f"[ORDER] WARNING: Using estimated shares (extraction failed)")
-                                            actual_shares = size_usd / order_price if order_price > 0 else 0
                                         if actual_price <= 0:
                                             actual_price = order_price
-                                        order_id = str(order_result.get("orderID", "") or order_result.get("orderId", ""))
-                                        update_pending_to_open(pending_id, order_id, actual_price, actual_shares)
-                                        daily_trades += 1
-                                        account_balance -= size_usd
-                                        status = "EXECUTED"
+                                        if actual_shares <= 0:
+                                            # CLOB reported matched/filled but gave no fill quantity.
+                                            # Never synthesize from requested size — that is the
+                                            # bug that produced phantom OPEN trades 9/10/12.
+                                            print(
+                                                f"[ORDER] ERROR: filled response with no share "
+                                                f"quantity on '{title}' — marking FAILED. "
+                                                f"Response: {order_result}"
+                                            )
+                                            update_pending_to_failed(pending_id)
+                                            status = "FILLED NO QTY"
+                                        else:
+                                            update_pending_to_open(pending_id, order_id, actual_price, actual_shares)
+                                            daily_trades += 1
+                                            account_balance -= size_usd
+                                            status = "EXECUTED"
+                                    elif is_order_resting(order_result):
+                                        # Limit order accepted and resting on the book.
+                                        # Leave PENDING, record order_id; resting-order
+                                        # poller (TODO) will later promote or cancel.
+                                        set_pending_order_id(pending_id, order_id)
+                                        print(
+                                            f"[POLL-ACTIVE] {username}: BUY resting on book for "
+                                            f"'{title}' ({order_id[:20]}...), left PENDING"
+                                        )
+                                        status = "RESTING"
                                     else:
                                         update_pending_to_failed(pending_id)
                                         print(f"[POLL-ACTIVE] {username}: order not filled on '{title}' (FOK killed)")
@@ -1132,19 +1180,45 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                         update_pending_to_failed(pending_id)
                         increment_needs_order_attempts(fp_id)
                         continue
+                    order_id = (
+                        str(order_result.get("orderID", "") or order_result.get("orderId", ""))
+                        if isinstance(order_result, dict) else ""
+                    )
                     if is_order_filled(order_result):
                         actual_shares = extract_fill_shares(order_result)
                         actual_price = extract_fill_price(order_result)
-                        if actual_shares <= 0:
-                            actual_shares = size_usd / order_price if order_price > 0 else 0
                         if actual_price <= 0:
                             actual_price = order_price
-                        order_id = str(order_result.get("orderID", "") or order_result.get("orderId", ""))
-                        update_pending_to_open(pending_id, order_id, actual_price, actual_shares)
-                        daily_trades += 1
-                        account_balance -= size_usd
+                        if actual_shares <= 0:
+                            # CLOB reported matched/filled but gave no fill quantity.
+                            # Never synthesize from requested size — that is the
+                            # bug that produced phantom OPEN trades 9/10/12.
+                            print(
+                                f"[ORDER] ERROR: filled response with no share "
+                                f"quantity on '{title}' — marking FAILED. "
+                                f"Response: {order_result}"
+                            )
+                            update_pending_to_failed(pending_id)
+                            increment_needs_order_attempts(fp_id)
+                        else:
+                            update_pending_to_open(pending_id, order_id, actual_price, actual_shares)
+                            daily_trades += 1
+                            account_balance -= size_usd
+                            clear_needs_order(fp_id)
+                            print(f"[POLL-ACTIVE] {pending_username}: EXECUTED BUY on '{title}' — {actual_shares:.2f} shares @ {actual_price:.4f}")
+                    elif is_order_resting(order_result):
+                        # Limit order resting on the book — not a fill, not a failure.
+                        # Leave PENDING (blocks re-entry via idempotency index),
+                        # record order_id for the future resting-order poller,
+                        # clear needs_order so we don't re-place. The resting-order
+                        # poller (TODO below run_reconciliation) will later either
+                        # promote this to OPEN on fill or cancel and mark FAILED.
+                        set_pending_order_id(pending_id, order_id)
                         clear_needs_order(fp_id)
-                        print(f"[POLL-ACTIVE] {pending_username}: EXECUTED BUY on '{title}' — {actual_shares:.2f} shares @ {actual_price:.4f}")
+                        print(
+                            f"[POLL-ACTIVE] {pending_username}: BUY resting on book for "
+                            f"'{title}' ({order_id[:20]}...), left PENDING"
+                        )
                     else:
                         update_pending_to_failed(pending_id)
                         increment_needs_order_attempts(fp_id)
@@ -1222,6 +1296,12 @@ def run_reconciliation(dry_run: bool = True):
     Cross-reference open copy_trades against followed_positions.
     If the source trader exited but we still hold, place SELL.
     Runs every 5 minutes. Failed sells are retried on the next cycle.
+
+    PENDING copy_trades are intentionally excluded: get_orphaned_copy_trades()
+    filters to status='OPEN' only. PENDING rows represent either a resting
+    limit order (owned by the upcoming resting-order poller, see TODO below)
+    or a transient state owned by the normal/active pollers — the reconciler
+    has no authoritative way to sell against them (shares=NULL).
     """
     orphans = get_orphaned_copy_trades()
 
@@ -1287,6 +1367,28 @@ def run_reconciliation(dry_run: bool = True):
             print(f"[RECONCILE] Sell failed for trade {trade_id} — will retry next cycle")
 
     print(f"[RECONCILE] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
+
+
+# ============================================================
+# Resting-order poller (TODO — not yet implemented)
+# ============================================================
+# Needed to handle copy_trades left in PENDING state because the CLOB accepted
+# the BUY as a resting limit order (status="live"). Those rows have an order_id
+# but no fill yet. The poller should, on a schedule (e.g. every 60s):
+#
+#   1. SELECT id, order_id, token_id, copied_at FROM copy_trades
+#      WHERE status = 'PENDING' AND order_id IS NOT NULL;
+#   2. For each, query the CLOB / order proxy for current order state:
+#        - FILLED  -> extract fill shares/price, call update_pending_to_open()
+#        - PARTIAL -> decide policy (promote partial or wait for more)
+#        - CANCELLED / EXPIRED -> update_pending_to_failed()
+#        - still LIVE and age > RESTING_ORDER_TIMEOUT -> cancel via proxy,
+#          then update_pending_to_failed()
+#
+# Without this, PENDING rows pile up forever and tie up notional in resting
+# orders that may never fill. Phantoms (like trades 9/10/12 before this fix)
+# are no longer the problem — stranded PENDING orders are the new failure mode.
+# ============================================================
 
 
 # ============================================================

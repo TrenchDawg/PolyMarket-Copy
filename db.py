@@ -419,6 +419,28 @@ def update_pending_to_failed(trade_id: int):
         release_conn(conn)
 
 
+def set_pending_order_id(trade_id: int, order_id: str):
+    """
+    Record the CLOB order_id on a PENDING copy trade without transitioning
+    to OPEN. Used when the CLOB accepted a limit order but it's resting on
+    the book ("live") — we keep the row PENDING so the idempotency index
+    still blocks duplicate placement, and a future resting-order poller can
+    use the recorded order_id to check fill status and either promote to
+    OPEN or cancel the order and mark FAILED.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET order_id = %s
+                WHERE id = %s AND status = 'PENDING'
+            """, (order_id, trade_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
 def has_pending_copy_trade(idempotency_key: str) -> bool:
     """
     Return True if we already have a copy_trade with this idempotency key
