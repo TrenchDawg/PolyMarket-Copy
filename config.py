@@ -47,6 +47,8 @@ POSITION_POLL_SECONDS = 120      # normal poll: check all followed traders every
 ACTIVE_TRADER_POLL_SECONDS = 30  # poll every 30s for traders with recent activity
 ACTIVE_TRADER_WINDOW_MINUTES = 10  # how long a trader stays in "active" mode after a detected entry or exit
 RECONCILIATION_INTERVAL_SECONDS = 300  # reconciliation: check for orphaned positions every 5 minutes
+STALE_ORDER_CLEANUP_INTERVAL_SECONDS = 600  # stale resting-order cleanup: every 10 minutes
+STALE_ORDER_AGE_MINUTES = 60     # cancel resting limit orders older than this (frees locked collateral)
 ALERT_SUMMARY_HOUR = 20          # daily summary at 8pm
 REALTIME_ALERT_MAX_POSITIONS = 50  # Only send real-time alerts for traders with ≤ 50 open positions
 

@@ -2,6 +2,7 @@
 Polymarket Copy Trader — API Client
 Handles all interactions with Polymarket's Data API, Gamma API, and CLOB API.
 """
+import json
 import time
 import requests
 from typing import Optional
@@ -12,6 +13,25 @@ from config import (
     LEADERBOARD_LIMIT,
     LEADERBOARD_MAX_PAGES,
 )
+
+
+def _parse_gamma_list(value) -> list:
+    """
+    Gamma API sometimes returns list fields (outcomes, outcomePrices) as JSON-
+    encoded strings instead of real arrays — e.g. '["Yes","No"]' rather than
+    ["Yes","No"]. Normalize both shapes to a Python list. Returns [] on garbage.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            return []
+    return []
 
 
 class PolymarketClient:
@@ -236,6 +256,95 @@ class PolymarketClient:
         return self._get(
             f"{POLYMARKET_CLOB_API}/markets/{condition_id}",
         )
+
+    def get_market_resolution(self, condition_id: str) -> Optional[dict]:
+        """
+        Query the Gamma API for a market's resolution state.
+
+        Returns a normalized dict, or None on transport failure (caller should
+        retry next cycle, NOT assume unresolved):
+
+            {
+                "resolved":     bool,           # True iff market has a final outcome
+                "outcomes":     ["Yes","No"],   # outcome names in index order
+                "outcome_prices": [1.0, 0.0],   # final prices in same index order;
+                                                # winner = 1.0, loser = 0.0
+                "winning_outcome": "Yes",       # convenience: name of the winner
+                                                # (None if not resolved)
+                "raw":          { ...gamma row... },
+            }
+
+        Resolution signal: Gamma marks a market `closed=true` once UMA has
+        resolved it and `outcomePrices` flips to ["1","0"] or ["0","1"].
+        We require BOTH signals to call it resolved — `closed` alone can mean
+        "market closed for trading but pending resolution."
+        """
+        if not condition_id:
+            return None
+
+        data = self._get(
+            f"{POLYMARKET_GAMMA_API}/markets",
+            params={"condition_ids": condition_id, "limit": 1},
+        )
+        # Gamma returns a list; an empty list means "no such market" (still a
+        # successful response — distinguish from None which means transport
+        # failure).
+        if data is None:
+            return None
+        if isinstance(data, list):
+            if not data:
+                return {
+                    "resolved": False,
+                    "outcomes": [],
+                    "outcome_prices": [],
+                    "winning_outcome": None,
+                    "raw": None,
+                }
+            row = data[0]
+        elif isinstance(data, dict):
+            row = data
+        else:
+            return None
+
+        outcomes = _parse_gamma_list(row.get("outcomes"))
+        prices = _parse_gamma_list(row.get("outcomePrices"))
+
+        # Normalize prices to floats; non-numeric entries become None
+        price_floats: list = []
+        for p in prices:
+            try:
+                price_floats.append(float(p))
+            except (TypeError, ValueError):
+                price_floats.append(None)
+
+        closed_flag = bool(row.get("closed"))
+        # A resolved market has exactly one outcome priced at ~1.0 and the
+        # rest at ~0.0. Use a tolerance: floats from the API are sometimes
+        # stringified ("1", "1.0", "0").
+        winners = [
+            i for i, p in enumerate(price_floats)
+            if p is not None and p >= 0.99
+        ]
+        losers_only = all(
+            (p is None) or (p <= 0.01) or (p >= 0.99)
+            for p in price_floats
+        )
+
+        resolved = closed_flag and len(winners) == 1 and losers_only and len(price_floats) >= 2
+
+        winning_outcome = None
+        if resolved:
+            idx = winners[0]
+            if 0 <= idx < len(outcomes):
+                winning_outcome = outcomes[idx]
+
+        return {
+            "resolved": resolved,
+            "outcomes": outcomes,
+            "outcome_prices": price_floats,
+            "winning_outcome": winning_outcome,
+            "raw": row,
+        }
 
     # ============================================================
     # Market holders

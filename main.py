@@ -11,11 +11,15 @@ Three-job architecture:
   5. Daily summary alert (at 8pm UTC)
 
 Usage:
-  python main.py                  # dry run (default)
-  python main.py --live           # live trading (requires confirmation)
-  python main.py --score-only     # just run the scorer once and exit
-  python main.py --poll-only      # just run one normal poll cycle and exit
-  python main.py --reconcile-only # just run one reconciliation cycle and exit
+  python main.py                       # dry run (default)
+  python main.py --live                # live trading (requires confirmation)
+  python main.py --live --cleanup-preview
+                                       # live trading, but stale-order cleanup
+                                       # logs proposed transitions without
+                                       # writing the DB or cancelling anything
+  python main.py --score-only          # just run the scorer once and exit
+  python main.py --poll-only           # just run one normal poll cycle and exit
+  python main.py --reconcile-only      # just run one reconciliation cycle and exit
 """
 
 print("[DEBUG] main.py starting...")
@@ -29,16 +33,23 @@ from apscheduler.triggers.cron import CronTrigger
 
 from db import init_db, get_conn, release_conn, get_followed_traders
 from trader_ranker import score_all_traders
-from copy_trader import poll_followed_traders, run_reconciliation, send_alert
+from copy_trader import (
+    poll_followed_traders,
+    run_reconciliation,
+    run_stale_order_cleanup,
+    send_alert,
+)
 from config import (
     POSITION_POLL_SECONDS,
     ACTIVE_TRADER_POLL_SECONDS,
     RECONCILIATION_INTERVAL_SECONDS,
+    STALE_ORDER_CLEANUP_INTERVAL_SECONDS,
     ALERT_SUMMARY_HOUR,
 )
 
 
 DRY_RUN = True
+CLEANUP_PREVIEW = False  # --cleanup-preview: blocks cleanup-job side effects only
 
 
 def run_scoring():
@@ -80,6 +91,25 @@ def run_reconcile():
         run_reconciliation(dry_run=DRY_RUN)
     except Exception as e:
         print(f"[SCHEDULER] Reconciliation failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def run_stale_cleanup():
+    """
+    Scheduled: Reconcile every PENDING copy_trade with on-chain state. May
+    cancel stale resting orders, promote filled-but-unrecorded orders, and
+    transition resolved-but-unrecorded ones to WON/LOST.
+
+    Honors --cleanup-preview (CLEANUP_PREVIEW): when on, the job runs all
+    reads but writes nothing. This is independent from --live; the cleanup
+    job normally writes DB updates even in dry-run mode so on-chain state
+    and our books stay aligned.
+    """
+    try:
+        run_stale_order_cleanup(cleanup_preview=CLEANUP_PREVIEW)
+    except Exception as e:
+        print(f"[SCHEDULER] Stale-order cleanup failed: {e}")
         import traceback
         traceback.print_exc()
 
@@ -139,12 +169,20 @@ def graceful_shutdown(signum, frame):
 
 
 def main():
-    global DRY_RUN
+    global DRY_RUN, CLEANUP_PREVIEW
 
     # Parse args
     if "--live" in sys.argv:
         DRY_RUN = False
         print("WARNING: LIVE MODE — real orders will be placed!")
+
+    if "--cleanup-preview" in sys.argv:
+        CLEANUP_PREVIEW = True
+        print(
+            "[MAIN] --cleanup-preview ON: stale-order cleanup will log proposed "
+            "transitions but write no DB changes and place no cancels. "
+            "Other jobs (polling, ordering) are unaffected."
+        )
 
     # Initialize database
     print("[MAIN] Initializing database...")
@@ -211,7 +249,17 @@ def main():
         coalesce=True,
     )
 
-    # Job 5: Daily summary
+    # Job 5: Stale resting-order cleanup — cancels old PENDING limit orders
+    scheduler.add_job(
+        run_stale_cleanup,
+        trigger=IntervalTrigger(seconds=STALE_ORDER_CLEANUP_INTERVAL_SECONDS),
+        id="stale_order_cleanup",
+        name="Stale Resting-Order Cleanup",
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Job 6: Daily summary
     scheduler.add_job(
         run_daily_summary,
         trigger=CronTrigger(hour=ALERT_SUMMARY_HOUR, minute=0),
@@ -228,6 +276,7 @@ def main():
     print(f"  Normal poll:     every {POSITION_POLL_SECONDS}s (detection only)")
     print(f"  Active poll:     every {ACTIVE_TRADER_POLL_SECONDS}s (order execution)")
     print(f"  Reconciliation:  every {RECONCILIATION_INTERVAL_SECONDS}s (orphan cleanup)")
+    print(f"  Stale cleanup:   every {STALE_ORDER_CLEANUP_INTERVAL_SECONDS}s (resting-order cancel)")
     print(f"  Summary:         daily at {ALERT_SUMMARY_HOUR}:00 UTC")
     print(f"{'='*60}\n")
 

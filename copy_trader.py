@@ -31,6 +31,7 @@ from config import (
     MIN_NOTIONAL_USD,
     REALTIME_ALERT_MAX_POSITIONS,
     ACTIVE_TRADER_WINDOW_MINUTES,
+    STALE_ORDER_AGE_MINUTES,
 )
 from db import (
     get_followed_traders,
@@ -38,7 +39,10 @@ from db import (
     log_pending_copy_trade,
     update_pending_to_open,
     update_pending_to_failed,
+    update_pending_to_resolved,
+    update_pending_to_cancelled,
     set_pending_order_id,
+    get_pending_orders_with_id,
     is_trading_enabled,
     get_config,
     set_config,
@@ -178,8 +182,8 @@ def is_order_resting(order_result) -> bool:
     the order exists on-chain, holds capital, and may fill later.
 
     Callers should leave the owning copy_trade in PENDING, record the
-    order_id, and let a resting-order poller (TODO below run_reconciliation)
-    later promote it to OPEN or cancel it.
+    order_id, and let run_stale_order_cleanup() later promote it to OPEN
+    or cancel it once it ages past STALE_ORDER_AGE_MINUTES.
     """
     if not order_result or not isinstance(order_result, dict):
         return False
@@ -395,6 +399,109 @@ def get_order_price(token_id: str, side: str = "buy") -> float:
     except Exception as e:
         print(f"[PRICE] Proxy request failed: {e}")
         return 0.0
+
+
+def get_order_state(order_id: str) -> Optional[dict]:
+    """
+    Fetch current state of a CLOB order via the Madrid proxy.
+
+    Returns:
+      - dict with order details on success ({"status": "LIVE"/"MATCHED"/...,
+        "size_matched": "...", "price": "...", ...})
+      - {"_not_found": True} if the CLOB no longer has the order
+      - None on transport/proxy failure (caller should retry next cycle)
+    """
+    from config import ORDER_PROXY_URL, ORDER_PROXY_AUTH_TOKEN
+    if not order_id:
+        return None
+    try:
+        resp = requests.get(
+            f"{ORDER_PROXY_URL}/order-state",
+            params={"order_id": order_id},
+            headers={"Authorization": f"Bearer {ORDER_PROXY_AUTH_TOKEN}"},
+            timeout=15,
+        )
+        data = resp.json() if resp.content else {}
+        if not data.get("success"):
+            print(f"[ORDER-STATE] Proxy error for {order_id[:20]}: {data.get('error')}")
+            return None
+        if data.get("not_found"):
+            return {"_not_found": True}
+        order = data.get("order")
+        if not isinstance(order, dict):
+            return None
+        return order
+    except Exception as e:
+        print(f"[ORDER-STATE] Proxy request failed: {e}")
+        return None
+
+
+def cancel_order(order_id: str) -> bool:
+    """
+    Cancel a resting CLOB order via the Madrid proxy.
+
+    Returns True iff the proxy confirmed the cancel was processed (or the
+    order was already off the book). On transport failure or explicit error,
+    returns False so the caller leaves the row PENDING and retries later.
+    """
+    from config import ORDER_PROXY_URL, ORDER_PROXY_AUTH_TOKEN
+    if not order_id:
+        return False
+    try:
+        resp = requests.post(
+            f"{ORDER_PROXY_URL}/cancel-order",
+            json={"order_id": order_id},
+            headers={"Authorization": f"Bearer {ORDER_PROXY_AUTH_TOKEN}"},
+            timeout=20,
+        )
+        data = resp.json() if resp.content else {}
+        if not data.get("success"):
+            print(f"[CANCEL] Proxy error for {order_id[:20]}: {data.get('error')}")
+            return False
+        return True
+    except Exception as e:
+        print(f"[CANCEL] Proxy request failed: {e}")
+        return False
+
+
+def _extract_state_status(state: dict) -> str:
+    """Normalize CLOB order status string to lowercase."""
+    return str(state.get("status", "")).lower() if isinstance(state, dict) else ""
+
+
+def _extract_state_filled_shares(state: dict) -> float:
+    """Extract filled share count from a CLOB get_order response."""
+    if not isinstance(state, dict):
+        return 0.0
+    for field in ("size_matched", "sizeMatched", "filled_size", "filledSize",
+                  "matched_size", "matchedSize"):
+        val = state.get(field)
+        if val is None:
+            continue
+        try:
+            f = float(val)
+            if f > 0:
+                return f
+        except (ValueError, TypeError):
+            continue
+    return 0.0
+
+
+def _extract_state_price(state: dict) -> float:
+    """Extract limit price from a CLOB get_order response."""
+    if not isinstance(state, dict):
+        return 0.0
+    for field in ("price", "limit_price", "limitPrice", "avg_price", "avgPrice"):
+        val = state.get(field)
+        if val is None:
+            continue
+        try:
+            f = float(val)
+            if f > 0:
+                return f
+        except (ValueError, TypeError):
+            continue
+    return 0.0
 
 
 # ============================================================
@@ -1209,10 +1316,11 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                     elif is_order_resting(order_result):
                         # Limit order resting on the book — not a fill, not a failure.
                         # Leave PENDING (blocks re-entry via idempotency index),
-                        # record order_id for the future resting-order poller,
-                        # clear needs_order so we don't re-place. The resting-order
-                        # poller (TODO below run_reconciliation) will later either
-                        # promote this to OPEN on fill or cancel and mark FAILED.
+                        # record order_id for run_stale_order_cleanup() to follow up,
+                        # clear needs_order so we don't re-place. The cleanup job
+                        # will later either promote this to OPEN on fill or cancel
+                        # and mark CANCELLED once the order ages past
+                        # STALE_ORDER_AGE_MINUTES.
                         set_pending_order_id(pending_id, order_id)
                         clear_needs_order(fp_id)
                         print(
@@ -1299,7 +1407,7 @@ def run_reconciliation(dry_run: bool = True):
 
     PENDING copy_trades are intentionally excluded: get_orphaned_copy_trades()
     filters to status='OPEN' only. PENDING rows represent either a resting
-    limit order (owned by the upcoming resting-order poller, see TODO below)
+    limit order (owned by run_stale_order_cleanup() below)
     or a transient state owned by the normal/active pollers — the reconciler
     has no authoritative way to sell against them (shares=NULL).
     """
@@ -1370,25 +1478,358 @@ def run_reconciliation(dry_run: bool = True):
 
 
 # ============================================================
-# Resting-order poller (TODO — not yet implemented)
+# Stale resting-order cleanup
 # ============================================================
-# Needed to handle copy_trades left in PENDING state because the CLOB accepted
-# the BUY as a resting limit order (status="live"). Those rows have an order_id
-# but no fill yet. The poller should, on a schedule (e.g. every 60s):
+# Handles copy_trades left in PENDING state. The DB has accumulated three
+# distinct failure modes that all look identical (status='PENDING', order_id
+# populated):
 #
-#   1. SELECT id, order_id, token_id, copied_at FROM copy_trades
-#      WHERE status = 'PENDING' AND order_id IS NOT NULL;
-#   2. For each, query the CLOB / order proxy for current order state:
-#        - FILLED  -> extract fill shares/price, call update_pending_to_open()
-#        - PARTIAL -> decide policy (promote partial or wait for more)
-#        - CANCELLED / EXPIRED -> update_pending_to_failed()
-#        - still LIVE and age > RESTING_ORDER_TIMEOUT -> cancel via proxy,
-#          then update_pending_to_failed()
+#   1. Resting limit orders the CLOB accepted but never filled (the original
+#      live-status problem).
+#   2. Already-filled orders that never transitioned PENDING -> OPEN because
+#      we lacked a live -> matched handler.
+#   3. Already-resolved positions that never transitioned through OPEN -> WON
+#      / LOST because the market closed before we promoted.
 #
-# Without this, PENDING rows pile up forever and tie up notional in resting
-# orders that may never fill. Phantoms (like trades 9/10/12 before this fix)
-# are no longer the problem — stranded PENDING orders are the new failure mode.
+# This job is the single point of truth that brings every PENDING row into
+# alignment with on-chain reality. Branches:
+#
+#   - matched/filled  + market unresolved -> promote to OPEN
+#   - matched/filled  + market resolved   -> mark WON/LOST with realized P&L
+#   - canceled/expired                    -> mark FAILED
+#   - live + age > STALE_ORDER_AGE_MINUTES -> cancel via proxy, mark CANCELLED
+#                                            (with cancel-race protection)
+#   - live + age <= cutoff                -> leave alone
+#   - not_found                           -> mark FAILED, flag for human review
+#   - anything else / transport error     -> leave alone, retry next cycle
 # ============================================================
+
+
+def _resolve_matched_branch(
+    trade: dict,
+    state: dict,
+    order_id: str,
+    cleanup_preview: bool,
+    verbose: bool,
+):
+    """
+    Handle a CLOB 'matched'/'filled' status. Cross-checks market resolution
+    via Gamma — if the market has resolved, transitions straight to WON/LOST
+    with realized P&L instead of OPEN.
+
+    Returns a short status string for the run-cycle log.
+    """
+    trade_id = trade["id"]
+    title = trade.get("market_title", "?")
+    username = trade.get("source_username", "?")
+    condition_id = trade.get("condition_id", "")
+    outcome = (trade.get("outcome") or "").strip()
+
+    shares = _extract_state_filled_shares(state)
+    price = _extract_state_price(state)
+
+    if shares <= 0 or price <= 0:
+        # Filled but no usable fill data — same failure mode that produced
+        # the phantom OPEN trades historically. Mark FAILED rather than
+        # synthesize numbers.
+        msg = (
+            f"'{title}' reports matched but missing fill data "
+            f"(shares={shares}, price={price}) — would mark FAILED. State: {state}"
+        )
+        if cleanup_preview:
+            print(f"[STALE-CLEANUP][PREVIEW] {username}: {msg}")
+        else:
+            print(f"[STALE-CLEANUP] {username}: {msg}")
+            update_pending_to_failed(trade_id)
+        return "FAILED (no fill data)"
+
+    resolution = client.get_market_resolution(condition_id) if condition_id else None
+    if verbose:
+        print(f"[STALE-CLEANUP][VERBOSE] resolution check id={trade_id} '{title}' -> {resolution}")
+
+    # If we couldn't determine resolution (Gamma transport error), be
+    # conservative: treat as unresolved and promote to OPEN. Reconciler/
+    # next cleanup cycle will catch it later if it really did resolve.
+    if resolution is None:
+        if cleanup_preview:
+            print(
+                f"[STALE-CLEANUP][PREVIEW] {username}: would PROMOTE '{title}' to OPEN "
+                f"({shares:.2f} @ {price:.4f}) — gamma resolution check failed, "
+                f"assuming unresolved"
+            )
+            return "OPEN (resolution unknown, preview)"
+        update_pending_to_open(trade_id, order_id, price, shares)
+        print(
+            f"[STALE-CLEANUP] {username}: PROMOTED '{title}' to OPEN "
+            f"({shares:.2f} @ {price:.4f}) — gamma unreachable, assumed unresolved"
+        )
+        return "OPEN (resolution unknown)"
+
+    # Market not yet resolved — normal promotion path
+    if not resolution.get("resolved"):
+        if cleanup_preview:
+            print(
+                f"[STALE-CLEANUP][PREVIEW] {username}: would PROMOTE '{title}' to OPEN "
+                f"({shares:.2f} @ {price:.4f}) — market unresolved"
+            )
+            return "OPEN (preview)"
+        update_pending_to_open(trade_id, order_id, price, shares)
+        print(
+            f"[STALE-CLEANUP] {username}: PROMOTED '{title}' to OPEN "
+            f"({shares:.2f} @ {price:.4f})"
+        )
+        return "OPEN"
+
+    # Market resolved — classify our side as WON or LOST by matching our
+    # outcome name (case-insensitive) against the market's outcomes.
+    #
+    # If our outcome name doesn't appear in the market's outcomes at all,
+    # we REFUSE to classify as LOST. Markets with unusual outcome naming
+    # (Above/Below, multi-outcome) could falsely book legitimate trades as
+    # losses and silently corrupt realized P&L. Mark FAILED instead so the
+    # row stays visible for manual reconciliation.
+    winning_outcome = (resolution.get("winning_outcome") or "").strip()
+    market_outcomes = resolution.get("outcomes") or []
+    market_outcomes_lower = [
+        str(o).strip().lower() for o in market_outcomes if str(o).strip()
+    ]
+    outcome_in_market = bool(outcome) and outcome.lower() in market_outcomes_lower
+
+    if not outcome_in_market:
+        msg = (
+            f"MISMATCH: trade outcome='{outcome}' not found in market "
+            f"outcomes={market_outcomes}. Marking FAILED for human review. "
+            f"(trade {trade_id}, '{title}', winner='{winning_outcome}')"
+        )
+        if cleanup_preview:
+            print(f"[STALE-CLEANUP][PREVIEW] {username}: {msg}")
+            return "FAILED (outcome mismatch, preview)"
+        print(f"[STALE-CLEANUP] {username}: {msg}")
+        update_pending_to_failed(trade_id)
+        return "FAILED (outcome mismatch)"
+
+    we_won = bool(winning_outcome) and (outcome.lower() == winning_outcome.lower())
+    new_status = "WON" if we_won else "LOST"
+
+    if we_won:
+        exit_price = 1.0
+        pnl = (1.0 - price) * shares
+    else:
+        exit_price = 0.0
+        pnl = -price * shares
+
+    if cleanup_preview:
+        print(
+            f"[STALE-CLEANUP][PREVIEW] {username}: would mark '{title}' as {new_status} "
+            f"(our outcome '{outcome}' vs winner '{winning_outcome}', "
+            f"shares={shares:.2f}, entry={price:.4f}, exit={exit_price:.2f}, "
+            f"pnl=${pnl:+.2f})"
+        )
+        return f"{new_status} (preview)"
+
+    update_pending_to_resolved(
+        trade_id=trade_id,
+        status=new_status,
+        order_id=order_id,
+        entry_price=price,
+        shares=shares,
+        exit_price=exit_price,
+        pnl=pnl,
+    )
+    print(
+        f"[STALE-CLEANUP] {username}: RESOLVED '{title}' as {new_status} "
+        f"(our '{outcome}' vs winner '{winning_outcome}', "
+        f"shares={shares:.2f}, entry={price:.4f}, pnl=${pnl:+.2f})"
+    )
+    return new_status
+
+
+def run_stale_order_cleanup(cleanup_preview: bool = False):
+    """
+    Bring every PENDING copy_trade with an order_id into alignment with CLOB
+    state and market resolution. Runs every 10 minutes via APScheduler.
+
+    `cleanup_preview` is a dedicated read-only mode for this job. It is
+    INDEPENDENT from the bot-wide dry_run flag:
+
+      - dry_run=True (no --live): the bot doesn't place orders, but the
+        cleanup job DOES still write reconciliation results to the DB. This
+        is intentional — we want the DB aligned with reality regardless of
+        whether trading is on.
+      - cleanup_preview=True (--cleanup-preview): the cleanup job makes all
+        CLOB / Gamma read calls and logs every proposed transition, but
+        writes nothing and cancels nothing. Used to audit the first run
+        against the 34 accumulated PENDINGs before letting it act.
+
+    Verbose logging of raw CLOB responses is enabled while cleanup_preview is
+    on, so we can validate the matched+resolved branch against known cases
+    like trade 15 (WTI $95 NO).
+    """
+    pending = get_pending_orders_with_id()
+    if not pending:
+        return
+
+    mode = "PREVIEW (no writes)" if cleanup_preview else "LIVE"
+    print(f"[STALE-CLEANUP] Checking {len(pending)} PENDING order(s) — mode={mode}")
+
+    # Verbose dump of raw CLOB / resolution payloads. On for previews and
+    # for the first live cycle (we'll drop this once it's verified).
+    verbose = cleanup_preview
+
+    cutoff_minutes = STALE_ORDER_AGE_MINUTES
+    can_cancel = is_trading_enabled() and not cleanup_preview
+
+    for trade in pending:
+        trade_id = trade["id"]
+        order_id = trade.get("order_id") or ""
+        title = trade.get("market_title", "?")
+        username = trade.get("source_username", "?")
+        try:
+            age_minutes = float(trade.get("age_minutes", 0) or 0)
+        except (TypeError, ValueError):
+            age_minutes = 0.0
+
+        if not order_id:
+            continue
+
+        state = get_order_state(order_id)
+        if verbose:
+            print(
+                f"[STALE-CLEANUP][VERBOSE] id={trade_id} '{title}' "
+                f"order_id={order_id[:30]}... age={age_minutes:.0f}min "
+                f"clob_state={state}"
+            )
+
+        if state is None:
+            print(
+                f"[STALE-CLEANUP] {username}: could not fetch state for '{title}' "
+                f"({order_id[:20]}...), retrying next cycle"
+            )
+            continue
+
+        if state.get("_not_found"):
+            # Order is gone from the CLOB and we don't know why. Could be a
+            # very old fill that aged out, or a manual cancel. Flag for human
+            # review rather than silently classifying.
+            msg = (
+                f"order not found on CLOB for '{title}' ({order_id[:20]}...), "
+                f"would mark FAILED — HUMAN REVIEW recommended (trade {trade_id})"
+            )
+            if cleanup_preview:
+                print(f"[STALE-CLEANUP][PREVIEW] {username}: {msg}")
+            else:
+                print(f"[STALE-CLEANUP] {username}: {msg}")
+                update_pending_to_failed(trade_id)
+            continue
+
+        status = _extract_state_status(state)
+
+        # ----- Filled: promote to OPEN, or jump to WON/LOST if resolved -----
+        if status in ("matched", "filled"):
+            _resolve_matched_branch(trade, state, order_id, cleanup_preview, verbose)
+            continue
+
+        # ----- CLOB-side cancellation/expiry: never had a fill -> FAILED -----
+        if status in ("canceled", "cancelled", "expired", "killed"):
+            if cleanup_preview:
+                print(
+                    f"[STALE-CLEANUP][PREVIEW] {username}: would mark '{title}' "
+                    f"FAILED (CLOB status={status})"
+                )
+            else:
+                update_pending_to_failed(trade_id)
+                print(
+                    f"[STALE-CLEANUP] {username}: '{title}' was {status} on CLOB, "
+                    f"marked FAILED"
+                )
+            continue
+
+        # ----- Still resting on the book -----
+        if status == "live":
+            if age_minutes < cutoff_minutes:
+                continue  # young enough, leave alone
+
+            if cleanup_preview:
+                print(
+                    f"[STALE-CLEANUP][PREVIEW] {username}: would cancel stale order "
+                    f"on '{title}' (age {age_minutes:.0f}min) and mark CANCELLED"
+                )
+                continue
+
+            if not can_cancel:
+                print(
+                    f"[STALE-CLEANUP] {username}: would cancel stale order on '{title}' "
+                    f"(age {age_minutes:.0f}min) — kill switch off"
+                )
+                continue
+
+            # Cancel-race protection: between our CLOB read and the cancel
+            # call the order may have filled. After requesting the cancel,
+            # re-read state and branch on what we actually see.
+            cancel_ok = cancel_order(order_id)
+            if not cancel_ok:
+                print(
+                    f"[STALE-CLEANUP] {username}: cancel request failed for '{title}', "
+                    f"will retry next cycle"
+                )
+                continue
+
+            post_state = get_order_state(order_id)
+            post_status = _extract_state_status(post_state) if isinstance(post_state, dict) else ""
+            if verbose:
+                print(
+                    f"[STALE-CLEANUP][VERBOSE] post-cancel state for id={trade_id}: {post_state}"
+                )
+
+            if post_state is None:
+                # Couldn't verify. Leave PENDING and let next cycle re-check
+                # rather than guessing at terminal state.
+                print(
+                    f"[STALE-CLEANUP] {username}: post-cancel state unreadable for "
+                    f"'{title}', leaving PENDING for next cycle"
+                )
+                continue
+
+            if post_state.get("_not_found") or post_status in ("canceled", "cancelled"):
+                update_pending_to_cancelled(trade_id)
+                print(
+                    f"[STALE-CLEANUP] {username}: CANCELLED stale order on '{title}' "
+                    f"(age {age_minutes:.0f}min, order {order_id[:20]}...)"
+                )
+                continue
+
+            if post_status in ("matched", "filled"):
+                # The order filled while we were trying to cancel — race won
+                # by the maker. Treat exactly like the matched branch above.
+                print(
+                    f"[STALE-CLEANUP] {username}: cancel race lost on '{title}' — "
+                    f"order filled during cancel, falling through to matched handler"
+                )
+                _resolve_matched_branch(
+                    trade, post_state, order_id, cleanup_preview=False, verbose=verbose
+                )
+                continue
+
+            if post_status == "live":
+                print(
+                    f"[STALE-CLEANUP] {username}: WARNING cancel did not take effect "
+                    f"on '{title}' (still live), leaving PENDING"
+                )
+                continue
+
+            print(
+                f"[STALE-CLEANUP] {username}: unexpected post-cancel status "
+                f"'{post_status}' on '{title}', leaving PENDING for next cycle"
+            )
+            continue
+
+        # ----- Anything else: log and leave alone -----
+        print(
+            f"[STALE-CLEANUP] {username}: unknown status '{status}' for '{title}' "
+            f"(trade {trade_id}), leaving as-is"
+        )
+
+    print(f"[STALE-CLEANUP] Cycle complete at {datetime.now(timezone.utc).isoformat()}")
 
 
 # ============================================================

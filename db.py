@@ -419,6 +419,67 @@ def update_pending_to_failed(trade_id: int):
         release_conn(conn)
 
 
+def update_pending_to_resolved(
+    trade_id: int,
+    status: str,
+    order_id: str,
+    entry_price: float,
+    shares: float,
+    exit_price: float,
+    pnl: float,
+):
+    """
+    Transition PENDING -> WON/LOST in a single write. Used by the stale-order
+    cleanup job when CLOB reports the order was filled AND the market has
+    already resolved by the time we look — i.e. the position never lived in
+    the OPEN state from our perspective.
+
+    All five outcome fields (entry_price, shares, order_id, exit_price, pnl)
+    are written together so the row is internally consistent for downstream
+    reporting.
+    """
+    if status not in ("WON", "LOST"):
+        raise ValueError(f"update_pending_to_resolved requires status WON or LOST, got {status!r}")
+
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET status = %s,
+                    order_id = %s,
+                    entry_price = %s,
+                    shares = %s,
+                    exit_price = %s,
+                    pnl = %s,
+                    resolved_at = NOW()
+                WHERE id = %s AND status = 'PENDING'
+            """, (status, order_id, entry_price, shares, exit_price, pnl, trade_id))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def update_pending_to_cancelled(trade_id: int):
+    """
+    Mark a PENDING copy trade as CANCELLED (resting limit order was cancelled
+    on the CLOB before any shares filled). Distinct from FAILED in that the
+    order DID exist on-chain and held collateral until cancellation.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE copy_trades
+                SET status = 'CANCELLED',
+                    resolved_at = NOW()
+                WHERE id = %s AND status = 'PENDING'
+            """, (trade_id,))
+        conn.commit()
+    finally:
+        release_conn(conn)
+
+
 def set_pending_order_id(trade_id: int, order_id: str):
     """
     Record the CLOB order_id on a PENDING copy trade without transitioning
@@ -513,6 +574,32 @@ def update_copy_trade_exit(trade_id: int, status: str, exit_price: float = None)
                 WHERE id = %s
             """, (status, exit_price, exit_price, exit_price, trade_id))
         conn.commit()
+    finally:
+        release_conn(conn)
+
+
+def get_pending_orders_with_id() -> list:
+    """
+    Return PENDING copy_trades that have an order_id recorded — i.e. resting
+    limit orders the CLOB accepted but never filled. Used by the stale-order
+    cleanup job to query CLOB state and either promote, cancel, or fail each
+    one. Includes copied_at so the caller can compute order age.
+    """
+    conn = get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, source_wallet, source_username, condition_id,
+                       token_id, market_title, outcome, side, size_usd,
+                       order_id, copied_at,
+                       EXTRACT(EPOCH FROM (NOW() - copied_at)) / 60.0 AS age_minutes
+                FROM copy_trades
+                WHERE status = 'PENDING'
+                  AND order_id IS NOT NULL
+                  AND order_id <> ''
+                ORDER BY copied_at ASC
+            """)
+            return cur.fetchall()
     finally:
         release_conn(conn)
 

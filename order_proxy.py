@@ -137,6 +137,77 @@ def get_price():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/order-state", methods=["GET"])
+def get_order_state():
+    """
+    Fetch current state of an order from the CLOB.
+
+    Query: ?order_id=0x...
+    Response: {"success": true, "order": { ...raw CLOB order... }}
+              or {"success": false, "error": "..."} on failure
+              or {"success": true, "order": null, "not_found": true}
+              when CLOB no longer has the order (already filled+removed).
+    """
+    if not verify_auth(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    order_id = request.args.get("order_id")
+    if not order_id:
+        return jsonify({"success": False, "error": "order_id required"}), 400
+
+    clob = get_clob_client()
+    if not clob:
+        return jsonify({"success": False, "error": "CLOB client not ready"}), 500
+
+    try:
+        order = clob.get_order(order_id)
+        # py-clob-client returns {} or None for missing orders depending on version
+        if not order:
+            return jsonify({"success": True, "order": None, "not_found": True})
+        return jsonify({"success": True, "order": order})
+    except Exception as e:
+        msg = str(e)
+        # 404 / "not found" responses bubble up as exceptions in some versions
+        if "not found" in msg.lower() or "404" in msg:
+            return jsonify({"success": True, "order": None, "not_found": True})
+        return jsonify({"success": False, "error": msg}), 500
+
+
+@app.route("/cancel-order", methods=["POST"])
+def cancel_order():
+    """
+    Cancel an open CLOB order.
+
+    Body: {"order_id": "0x..."}
+    Response: {"success": true, "result": { ...raw CLOB cancel response... }}
+              or {"success": false, "error": "..."} on failure.
+
+    Note: CLOB returns success even when an order is already filled/cancelled —
+    in those cases the order_id appears under "not_canceled" with a reason.
+    Caller should treat both shapes as "no longer resting on the book".
+    """
+    if not verify_auth(request):
+        return jsonify({"error": "unauthorized"}), 401
+
+    clob = get_clob_client()
+    if not clob:
+        return jsonify({"success": False, "error": "CLOB client not ready"}), 500
+
+    try:
+        data = request.get_json() or {}
+        order_id = data.get("order_id")
+        if not order_id:
+            return jsonify({"success": False, "error": "order_id required"}), 400
+
+        print(f"[PROXY] Cancelling order {order_id[:30]}...")
+        result = clob.cancel(order_id=order_id)
+        print(f"[PROXY] Cancel result: {result}")
+        return jsonify({"success": True, "result": result})
+    except Exception as e:
+        print(f"[PROXY] Cancel failed: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @app.route("/execute-order", methods=["POST"])
 def execute_order():
     """
@@ -223,6 +294,8 @@ if __name__ == "__main__":
     print("    GET  /geocheck")
     print("    GET  /balance")
     print("    GET  /price?token_id=...&side=buy")
+    print("    GET  /order-state?order_id=...")
+    print("    POST /cancel-order")
     print("    POST /execute-order")
     print("=" * 60)
     app.run(host="0.0.0.0", port=8080)
