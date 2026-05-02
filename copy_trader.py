@@ -32,6 +32,7 @@ from config import (
     REALTIME_ALERT_MAX_POSITIONS,
     ACTIVE_TRADER_WINDOW_MINUTES,
     STALE_ORDER_AGE_MINUTES,
+    MIN_HIGH_CONFIDENCE_PRICE,
 )
 from db import (
     get_followed_traders,
@@ -925,9 +926,19 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
 
                 # Only the active poller places BUY orders
                 if mode == "active" and live_trading and token_id and size_usd > 0:
+                    _allow = entry_price >= MIN_HIGH_CONFIDENCE_PRICE
+                    _band = "high" if _allow else "low"
+                    print(f"[DIAG] price-band: {entry_price} → {'ALLOW' if _allow else 'SKIP'} (band={_band})")
+
                     idem_key = make_idempotency_key(wallet, token_id)
 
-                    if has_pending_copy_trade(idem_key):
+                    if not _allow:
+                        print(
+                            f"[FILTER] Skipped {title} at entry={entry_price:.2f} — "
+                            f"below MIN_HIGH={MIN_HIGH_CONFIDENCE_PRICE}"
+                        )
+                        status = f"SKIP (price band {_band})"
+                    elif has_pending_copy_trade(idem_key):
                         print(f"[POLL-ACTIVE] {username}: already have open copy_trade for {token_id[:16]}..., skipping")
                         status = "DUPLICATE"
                     elif not is_trading_enabled():
@@ -1234,6 +1245,18 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 if order_price <= 0:
                     increment_needs_order_attempts(fp_id)
                     print(f"[POLL-ACTIVE] {pending_username}: no price for '{title}', will retry (attempt {attempts+1})")
+                    continue
+
+                entry_price = order_price
+                _allow = entry_price >= MIN_HIGH_CONFIDENCE_PRICE
+                _band = "high" if _allow else "low"
+                print(f"[DIAG] price-band: {entry_price} → {'ALLOW' if _allow else 'SKIP'} (band={_band})")
+                if not _allow:
+                    print(
+                        f"[FILTER] Skipped {title} at entry={entry_price:.2f} — "
+                        f"below MIN_HIGH={MIN_HIGH_CONFIDENCE_PRICE}"
+                    )
+                    clear_needs_order(fp_id)
                     continue
 
                 size_usd = calculate_trade_size(account_balance, order_price)

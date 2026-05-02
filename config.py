@@ -61,6 +61,12 @@ DAILY_LOSS_LIMIT_USD = 25.0         # auto-disable kill switch if realized losse
 MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
 PARTIAL_SIZE_CHANGE_THRESHOLD = 0.20  # Alert if trader resizes a position by more than 20%
 
+# Entry-price filter: prior Kalshi data and current Polymarket data show
+# trades entered above MIN_HIGH_CONFIDENCE_PRICE have a high win rate, while
+# anything below performs poorly. Polymarket threshold is tighter than Kalshi
+# (0.80) because Polymarket markets are less liquid and have wider spreads.
+MIN_HIGH_CONFIDENCE_PRICE = 0.85    # only copy BUYs at or above this price
+
 # ============================================================
 # Order rounding (Polymarket CLOB increments)
 # ============================================================
