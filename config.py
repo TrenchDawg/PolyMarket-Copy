@@ -60,6 +60,7 @@ MAX_DAILY_TRADES = 10               # circuit breaker
 DAILY_LOSS_LIMIT_USD = 25.0         # auto-disable kill switch if realized losses today exceed this
 MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
 PARTIAL_SIZE_CHANGE_THRESHOLD = 0.20  # Alert if trader resizes a position by more than 20%
+MAX_DAILY_FAILSAFE_TRIGGERS = 3      # max times per day we bump a sub-MIN_ORDER_SHARES order up to exactly 5 shares
 
 # Entry-price filter: prior Kalshi data and current Polymarket data show
 # trades entered above MIN_HIGH_CONFIDENCE_PRICE have a high win rate, while
@@ -108,15 +109,11 @@ DATABASE_URL = os.getenv(
 ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
 
 # ============================================================
-# Position sizing (U-shaped, balance-relative)
+# Position sizing (flat, balance-relative)
 # ============================================================
-# High-probability (90¢+) and high-EV (60-70¢) prices get more capital;
-# dead zone around 80¢ gets minimum allocation. Floor and ceiling scale
-# with account balance so sizing stays proportional as the account grows.
-TRADE_SIZE_FLOOR_PCT = 0.01      # 1% of account = minimum trade
-TRADE_SIZE_CEILING_PCT = 0.05    # 5% of account = maximum trade
-TRADE_SIZE_MIDPOINT = 0.80       # Dead zone center — lowest allocation
-TRADE_SIZE_MAX_DISTANCE = 0.20   # Max distance from midpoint for normalization
+# Flat allocation within the 85¢+ band — evaluation period. Capped by
+# MAX_TRADE_SIZE_USD; floors at MIN_ORDER_SHARES (5 shares) / MIN_NOTIONAL_USD.
+TRADE_SIZE_PCT = 0.035           # 3.5% of account balance per copy trade
 
 # ============================================================
 # Polymarket CLOB (order execution)

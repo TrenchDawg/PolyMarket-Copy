@@ -136,6 +136,16 @@ BEGIN
     END IF;
 END $$;
 
+-- Failsafe bump tracking: marks a copy_trade whose size was bumped up to the
+-- exact MIN_ORDER_SHARES floor because the flat-percent sizing fell short.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                   WHERE table_name = 'copy_trades' AND column_name = 'failsafe_bumped') THEN
+        ALTER TABLE copy_trades ADD COLUMN failsafe_bumped BOOLEAN DEFAULT FALSE;
+    END IF;
+END $$;
+
 -- ============================================================
 -- SCORING_HISTORY: Track how trader scores change over time
 -- ============================================================
