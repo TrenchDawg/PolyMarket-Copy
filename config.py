@@ -26,9 +26,9 @@ assert abs(sum(SCORING_WEIGHTS.values()) - 1.0) < 0.001, "Weights must sum to 1.
 # ============================================================
 MIN_RESOLVED_POSITIONS = 30      # minimum closed trades to be scored
 MIN_VOLUME_USD = 500            # minimum total volume (basic dust filter)
-MAX_DAYS_SINCE_LAST_TRADE = 14   # must have traded recently
+MAX_DAYS_SINCE_LAST_TRADE = 30   # must have traded recently
 REQUIRE_POSITIVE_PNL = True      # only score profitable traders
-MIN_RECENT_WIN_RATE = 0.90       # 90% win rate in last 30 days
+MIN_RECENT_WIN_RATE = 0.85       # 85% win rate in last 30 days
 MIN_POSITIONS_VALUE = 0.01       # must have live positions worth >$0
 MIN_ROI = 0.025                  # 2.5% minimum blended ROI
 
@@ -85,7 +85,7 @@ HEALTH_PENALTY_FACTOR = 0.5     # how aggressively to penalize (0.5 = moderate)
 # Efficiency bonus (rewards traders strong on BOTH WR and ROI)
 # ============================================================
 EFFICIENCY_BONUS_MAX = 0.15     # max composite score boost (15%)
-EFFICIENCY_WR_BASELINE = 0.89   # WR baseline for efficiency calc (90% WR → small positive)
+EFFICIENCY_WR_BASELINE = 0.85   # WR baseline for efficiency calc — matches MIN_RECENT_WIN_RATE so qualifying traders never get a negative efficiency contribution
 
 # ============================================================
 # Recent performance weighting
