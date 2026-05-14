@@ -686,13 +686,24 @@ def check_spread(token_id: str) -> tuple:
 
 
 def get_daily_trade_count() -> int:
-    """Count how many copy trades we've made today."""
+    """
+    Count today's successfully-placed copy BUYs, dedup'd by idempotency_key.
+    Excludes FAILED/CANCELLED rows and PENDING rows that never reached the
+    book (no order_id) so retries and rejected attempts cannot inflate the
+    MAX_DAILY_TRADES circuit breaker. Auto-resets at UTC midnight via
+    CURRENT_DATE.
+    """
     conn = get_conn()
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT COUNT(*) FROM copy_trades
+                SELECT COUNT(DISTINCT idempotency_key) FROM copy_trades
                 WHERE copied_at::date = CURRENT_DATE
+                  AND side = 'BUY'
+                  AND (
+                        status IN ('OPEN', 'WON', 'LOST')
+                        OR (status = 'PENDING' AND order_id IS NOT NULL AND order_id != '')
+                      )
             """)
             return cur.fetchone()[0]
     finally:
