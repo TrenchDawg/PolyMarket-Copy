@@ -19,7 +19,7 @@ python3 -m venv venv
 source venv/bin/activate
 
 echo "=== Installing dependencies ==="
-pip install flask py-clob-client gunicorn requests
+pip install flask py-clob-client-v2 gunicorn requests
 
 echo "=== Creating environment file ==="
 cat > /opt/order-proxy/.env << 'ENVEOF'

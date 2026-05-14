@@ -120,7 +120,7 @@ TRADE_SIZE_PCT = 0.035           # 3.5% of account balance per copy trade
 # ============================================================
 POLYMARKET_CLOB_HOST = "https://clob.polymarket.com"
 POLYMARKET_CHAIN_ID = 137           # Polygon
-POLYMARKET_SIGNATURE_TYPE = 1       # 1 = Magic/email wallet
+POLYMARKET_SIGNATURE_TYPE = 3       # 3 = post-migration deposit wallet (current Polymarket account model). Was 1 for legacy Magic/email wallets.
 
 # ============================================================
 # Polymarket authentication (for order placement)

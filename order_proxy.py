@@ -39,8 +39,8 @@ def get_clob_client():
         return None
 
     try:
-        from py_clob_client.client import ClobClient
-        from py_clob_client.clob_types import ApiCreds
+        from py_clob_client_v2.client import ClobClient
+        from py_clob_client_v2.clob_types import ApiCreds
 
         creds = ApiCreds(
             api_key=POLY_API_KEY,
@@ -51,7 +51,7 @@ def get_clob_client():
             host="https://clob.polymarket.com",
             key=POLY_PRIVATE_KEY,
             chain_id=137,
-            signature_type=1,
+            signature_type=3,  # post-migration deposit wallet model (SDK docs cover 0/1/2 only, type 3 accepted at runtime)
             funder=POLY_WALLET_ADDRESS,
             creds=creds,
         )
@@ -103,9 +103,9 @@ def get_balance():
         return jsonify({"error": "CLOB client not ready"}), 500
 
     try:
-        from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+        from py_clob_client_v2.clob_types import BalanceAllowanceParams, AssetType
         result = clob.get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=1)
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL, signature_type=3)
         )
         raw = int(result.get("balance", 0))
         balance_usd = raw / 1_000_000
@@ -200,7 +200,8 @@ def cancel_order():
             return jsonify({"success": False, "error": "order_id required"}), 400
 
         print(f"[PROXY] Cancelling order {order_id[:30]}...")
-        result = clob.cancel(order_id=order_id)
+        from py_clob_client_v2.clob_types import OrderPayload
+        result = clob.cancel_order(OrderPayload(orderID=order_id))
         print(f"[PROXY] Cancel result: {result}")
         return jsonify({"success": True, "result": result})
     except Exception as e:
@@ -256,7 +257,7 @@ def execute_order():
 
         print(f"[PROXY] Placing {side} order: {size} shares @ ${price} for token {token_id[:30]}... (tick={tick_size}, neg_risk={neg_risk})")
 
-        from py_clob_client.clob_types import OrderArgs, CreateOrderOptions
+        from py_clob_client_v2.clob_types import OrderArgs, CreateOrderOptions
         options = CreateOrderOptions(tick_size=tick_size, neg_risk=neg_risk)
         result = clob.create_and_post_order(
             OrderArgs(
