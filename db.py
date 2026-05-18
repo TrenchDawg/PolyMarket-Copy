@@ -363,7 +363,6 @@ def log_pending_copy_trade(trade: dict) -> int:
     """
     trade = dict(trade)
     trade.setdefault("idempotency_key", None)
-    trade.setdefault("failsafe_bumped", False)
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -371,36 +370,17 @@ def log_pending_copy_trade(trade: dict) -> int:
                 INSERT INTO copy_trades (
                     source_wallet, source_username, condition_id,
                     token_id, market_title, market_slug, outcome,
-                    side, size_usd, idempotency_key, failsafe_bumped, status
+                    side, size_usd, idempotency_key, status
                 ) VALUES (
                     %(source_wallet)s, %(source_username)s, %(condition_id)s,
                     %(token_id)s, %(market_title)s, %(market_slug)s, %(outcome)s,
-                    %(side)s, %(size_usd)s, %(idempotency_key)s, %(failsafe_bumped)s, 'PENDING'
+                    %(side)s, %(size_usd)s, %(idempotency_key)s, 'PENDING'
                 )
                 RETURNING id
             """, trade)
             trade_id = cur.fetchone()[0]
         conn.commit()
         return trade_id
-    finally:
-        release_conn(conn)
-
-
-def get_daily_failsafe_count() -> int:
-    """
-    Count today's copy_trades whose size was bumped by the failsafe. Drives the
-    MAX_DAILY_FAILSAFE_TRIGGERS budget — counts every bump that produced a row,
-    regardless of whether the order ultimately filled.
-    """
-    conn = get_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT COUNT(*) FROM copy_trades
-                WHERE failsafe_bumped = TRUE
-                  AND copied_at::date = CURRENT_DATE
-            """)
-            return cur.fetchone()[0]
     finally:
         release_conn(conn)
 

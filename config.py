@@ -60,7 +60,6 @@ MAX_DAILY_TRADES = 10               # circuit breaker
 DAILY_LOSS_LIMIT_USD = 25.0         # auto-disable kill switch if realized losses today exceed this
 MAX_SPREAD_PCT = 0.05               # skip wide-spread markets (5%)
 PARTIAL_SIZE_CHANGE_THRESHOLD = 0.20  # Alert if trader resizes a position by more than 20%
-MAX_DAILY_FAILSAFE_TRIGGERS = 3      # max times per day we bump a sub-MIN_ORDER_SHARES order up to exactly 5 shares
 
 # Entry-price filter: prior Kalshi data and current Polymarket data show
 # trades entered above MIN_HIGH_CONFIDENCE_PRICE have a high win rate, while
@@ -111,8 +110,12 @@ ALERT_WEBHOOK_URL = os.getenv("ALERT_WEBHOOK_URL", "")
 # ============================================================
 # Position sizing (flat, balance-relative)
 # ============================================================
-# Flat allocation within the 85¢+ band — evaluation period. Capped by
-# MAX_TRADE_SIZE_USD; floors at MIN_ORDER_SHARES (5 shares) / MIN_NOTIONAL_USD.
+# Per copy trade we send max(MIN_TRADE_SIZE_USD, balance * TRADE_SIZE_PCT),
+# capped at MAX_TRADE_SIZE_USD. The floor exists because Polymarket's 5-share
+# minimum makes proportional sizing infeasible below ~$140 of balance — the
+# floor takes over at small balances and the percent takes over once it grows
+# past the floor.
+MIN_TRADE_SIZE_USD = 5.0         # floor per trade (clears Polymarket's 5-share / $1 minimums at the 0.85+ price band)
 TRADE_SIZE_PCT = 0.035           # 3.5% of account balance per copy trade
 
 # ============================================================

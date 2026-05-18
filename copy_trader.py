@@ -30,7 +30,7 @@ from config import (
     ACTIVE_TRADER_WINDOW_MINUTES,
     STALE_ORDER_AGE_MINUTES,
     MIN_HIGH_CONFIDENCE_PRICE,
-    MAX_DAILY_FAILSAFE_TRIGGERS,
+    MIN_TRADE_SIZE_USD,
 )
 from db import (
     get_followed_traders,
@@ -66,7 +66,6 @@ from db import (
     get_trades_needing_sell,
     clear_needs_sell,
     set_needs_sell,
-    get_daily_failsafe_count,
 )
 
 
@@ -101,41 +100,26 @@ def round_to_tick(value: float, tick: float = LOT_SIZE) -> float:
 def calculate_trade_size(
     account_balance: float,
     entry_price: float,
-    allow_failsafe: bool = False,
-) -> tuple[float, bool]:
+) -> float:
     """
-    Flat sizing: TRADE_SIZE_PCT of account balance per copy trade, capped by
-    MAX_TRADE_SIZE_USD. Returns (size_usd, was_bumped).
-
-    If the natural sizing falls below MIN_ORDER_SHARES and `allow_failsafe` is
-    True, the size is bumped up to exactly MIN_ORDER_SHARES * entry_price so
-    the order still places. Returns (0.0, False) when the order can't run at
-    all (no balance, bumped size exceeds caps, etc.).
+    Per copy trade: max(MIN_TRADE_SIZE_USD, balance * TRADE_SIZE_PCT), capped
+    at MAX_TRADE_SIZE_USD. Returns 0.0 when the order can't run at all (no
+    balance, floor exceeds caps/balance, sub-minimum notional, or share count
+    below Polymarket's MIN_ORDER_SHARES after rounding).
     """
     if entry_price <= 0 or entry_price >= 1 or account_balance <= 0:
-        return 0.0, False
+        return 0.0
 
-    size = min(account_balance * TRADE_SIZE_PCT, MAX_TRADE_SIZE_USD)
+    size = min(max(MIN_TRADE_SIZE_USD, account_balance * TRADE_SIZE_PCT), MAX_TRADE_SIZE_USD)
     size = round_to_tick(size, LOT_SIZE)
 
-    shares = size / entry_price
+    if size > account_balance or size < MIN_NOTIONAL_USD:
+        return 0.0
 
-    if shares < MIN_ORDER_SHARES:
-        if not allow_failsafe:
-            return 0.0, False
-        bumped = round(MIN_ORDER_SHARES * entry_price, 2)
-        if (
-            bumped > MAX_TRADE_SIZE_USD
-            or bumped > account_balance
-            or bumped < MIN_NOTIONAL_USD
-        ):
-            return 0.0, False
-        return bumped, True
+    if size / entry_price < MIN_ORDER_SHARES:
+        return 0.0
 
-    if size < MIN_NOTIONAL_USD:
-        return 0.0, False
-
-    return size, False
+    return size
 
 
 def make_idempotency_key(source_wallet: str, asset_id: str) -> str:
@@ -842,7 +826,6 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
     account_balance = 0.0
     daily_trades = 0
     max_daily = MAX_DAILY_TRADES
-    failsafe_count = 0
 
     if mode == "active":
         live_trading = is_trading_enabled() and not dry_run
@@ -862,11 +845,6 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
             max_daily = int(get_config("max_daily_trades") or MAX_DAILY_TRADES)
         except (TypeError, ValueError):
             max_daily = MAX_DAILY_TRADES
-        try:
-            failsafe_count = get_daily_failsafe_count()
-        except Exception as e:
-            print(f"[POLL-ACTIVE] Could not fetch daily failsafe count: {e}")
-            failsafe_count = 0
 
         # B-02 fix: check daily realized loss limit before placing any orders
         if live_trading:
@@ -957,21 +935,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                     except Exception as e:
                         print(f"[POLL-ACTIVE] balance refresh failed ({e}), using prior value ${account_balance:.2f}")
 
-                _allow_failsafe = (
-                    mode == "active"
-                    and live_trading
-                    and failsafe_count < MAX_DAILY_FAILSAFE_TRIGGERS
-                )
-                size_usd, _bumped = calculate_trade_size(
-                    account_balance, entry_price, allow_failsafe=_allow_failsafe
-                )
-                if _bumped:
-                    failsafe_count += 1
-                    print(
-                        f"[FAILSAFE] {username}: bumped to {MIN_ORDER_SHARES:.0f} shares "
-                        f"(${size_usd:.2f}) on '{title}' @ {entry_price:.2f} — "
-                        f"{failsafe_count}/{MAX_DAILY_FAILSAFE_TRIGGERS} today"
-                    )
+                size_usd = calculate_trade_size(account_balance, entry_price)
 
                 status = "DETECTED"
 
@@ -1033,7 +997,6 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                                         "side": "BUY",
                                         "size_usd": size_usd,
                                         "idempotency_key": idem_key,
-                                        "failsafe_bumped": _bumped,
                                     })
                                 except psycopg2.errors.UniqueViolation:
                                     print(
@@ -1318,17 +1281,7 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                 except Exception as e:
                     print(f"[POLL-ACTIVE] balance refresh failed ({e}), using prior value ${account_balance:.2f}")
 
-                _allow_failsafe = failsafe_count < MAX_DAILY_FAILSAFE_TRIGGERS
-                size_usd, _bumped = calculate_trade_size(
-                    account_balance, order_price, allow_failsafe=_allow_failsafe
-                )
-                if _bumped:
-                    failsafe_count += 1
-                    print(
-                        f"[FAILSAFE] {pending_username}: bumped to {MIN_ORDER_SHARES:.0f} shares "
-                        f"(${size_usd:.2f}) on '{title}' @ {order_price:.2f} — "
-                        f"{failsafe_count}/{MAX_DAILY_FAILSAFE_TRIGGERS} today"
-                    )
+                size_usd = calculate_trade_size(account_balance, order_price)
                 print(f"[DIAG] size_usd={size_usd:.2f}")
                 if size_usd <= 0:
                     clear_needs_order(fp_id)
@@ -1354,7 +1307,6 @@ def poll_followed_traders(dry_run: bool = True, mode: str = "normal"):
                         "side": "BUY",
                         "size_usd": size_usd,
                         "idempotency_key": idem_key,
-                        "failsafe_bumped": _bumped,
                     })
                 except psycopg2.errors.UniqueViolation:
                     clear_needs_order(fp_id)
